@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BINOLLA — Binolla WebSocket API Client (نسخة مبسّطة)
+BINOLLA — Binolla Candle Fetcher (نسخة مبسّطة)
 =====================================================
 يتصل بمنصة Binolla (https://binolla.com/ar/) عبر WebSocket
 باستخدام بروتوكول Socket.IO v4 / Engine.IO v4:
@@ -9,19 +9,18 @@ BINOLLA — Binolla WebSocket API Client (نسخة مبسّطة)
     wss://ws3.binolla.com/socket.io/?EIO=4&transport=websocket
 
 يدعم:
-  - **طريقتان للمصادقة**:
-    (أ) JWT token مباشرة (يُستخرج يدوياً من Local Storage في المتصفح).
-    (ب) تسجيل دخول بالإيميل وكلمة المرور عبر Playwright (متصفح Chromium)
-        — يفتح https://binolla.com/login، يعبّئ input[name="email"] و
-        input[name="password"] و input[name="remember"] تلقائياً،
-        ثم ينتظر من المستخدم حل Cloudflare Turnstile CAPTCHA إن ظهرت.
-        بعد نجاح الدخول يُستخرج JWT من Local Storage تلقائياً.
+  - **تسجيل دخول HTTP بالإيميل/كلمة المرور** بنفس بنية qx__1.py:
+      * Browser(Session) + CipherSuiteAdapter (TLS fingerprinting يحاكي Chrome)
+      * Login(Browser)  : GET /login → استخراج CSRF → POST form data
+                          (email, password, remember) → استخراج JWT
+      * Settings(Browser) : GET /api/state و /api/dictionaries
+  - مصادقة JWT عبر WebSocket (42["authorization",{token,...}]).
   - استلام الرسائل الثنائية (binary events بصيغة 451-[...]).
   - جلب: الأصول، الأرصدة، الإعدادات، الطلبات المفتوحة/المغلقة،
     التنبيهات، الشموع التاريخية، الاقتباسات اللحظية (quotes).
   - تغيير الأصل والفريم عبر asset/list/change.
   - وضع صفقات (binary options) عبر orders/open.
-  - حفظ التوكن والإيميل/كلمة المرور محلياً.
+  - حفظ الإيميل/كلمة المرور والتوكن في credentials.json.
 
 البروتوكول باختصار:
   - 0{...}        Engine.IO OPEN  (sid, pingInterval=25s, pingTimeout=20s)
@@ -32,22 +31,21 @@ BINOLLA — Binolla WebSocket API Client (نسخة مبسّطة)
                                               (متبوع بإطار ثنائي واحد)
   - 2 / 3         Engine.IO PING / PONG (الخادم يرسل 2، العميل يردّ بـ 3)
 
+حقول نموذج تسجيل الدخول في https://binolla.com/login:
+  - input[name="email"]     (type=text,    id ديناميكي مثل :r0:)
+  - input[name="password"]  (type=password, id ديناميكي مثل :r1:)
+  - input[name="remember"]  (type=checkbox)
+  - input[name="cf-turnstile-response"]  (مخفي — Cloudflare CAPTCHA)
+
+ملاحظة: الـ IDs ديناميكية، لذا نعتمد على `name` فقط (كما في qx__1.py).
+
 الاستخدام:
-    # الطريقة 1: JWT مباشر
     python bn__1.py
-    # ثم اختر "J" للـ JWT والصق التوكن
+  ثم أدخل الإيميل وكلمة المرور (تُحفظ تلقائياً في credentials.json).
 
-    # الطريقة 2: تسجيل دخول بالإيميل/كلمة المرور (يفتح متصفح Chromium)
-    python bn__1.py
-    # ثم اختر "E" للإيميل/كلمة المرور
-
-    # أو بصيغة non-interactive:
+  أو بصيغة non-interactive:
     BINOLLA_EMAIL="you@example.com" BINOLLA_PASSWORD="secret" \\
         python bn__1.py --asset EURUSD_otc --period 1 --days 7 -y
-
-متطلبات Playwright (للطريقة 2 فقط):
-    pip install playwright
-    playwright install chromium
 """
 
 import os
@@ -70,14 +68,12 @@ from enum import IntEnum
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import certifi
+import requests
 import websocket
-
-# Playwright اختياري — يُحمّل فقط عند الحاجة لتسجيل الدخول بالإيميل/كلمة المرور
-try:
-    from playwright.async_api import async_playwright as _async_playwright
-    HAS_PLAYWRIGHT = True
-except Exception:
-    HAS_PLAYWRIGHT = False
+from bs4 import BeautifulSoup
+from requests import Session
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 try:
     import orjson as _orjson
@@ -97,6 +93,23 @@ USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
+)
+
+# إعدادات TLS fingerprinting (تحاكي Chrome) لتجاوز اكتشاف البوتات البسيط
+DEFAULT_CIPHER_SUITE = (
+    'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:'
+    'ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:'
+    'ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:'
+    'DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384'
+)
+DEFAULT_ECDH_CURVE = 'prime256v1'
+
+# استراتيجية إعادة المحاولة لطلبات HTTP
+retry_strategy = Retry(
+    total=3,
+    backoff_factor=0.5,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET", "POST"],
 )
 
 CREDENTIALS_FILE = Path("credentials.json")
@@ -226,6 +239,98 @@ def _schedule_event_set(event: Optional[asyncio.Event],
 
 async def _set_event_async(event: asyncio.Event) -> None:
     event.set()
+
+
+# ==============================================================================
+# SECTION 2.5: HTTP NAVIGATOR (Browser + CipherSuiteAdapter)
+# ==============================================================================
+# مطابق لـ qx__1.py — يستخدم ترتيب Cipher Suites يحاكي Chrome،
+# مما يساعد على تجاوز اكتشاف البوتات البسيط في Cloudflare/CDN.
+
+class CipherSuiteAdapter(HTTPAdapter):
+    """HTTPAdapter مخصّص يضبط TLS cipher suites و ECDH curve لمحاكاة Chrome."""
+    __attrs__ = ['ssl_context', 'max_retries', 'config', '_pool_connections',
+                 '_pool_maxsize', '_pool_block', 'source_address']
+
+    def __init__(self, *args, **kwargs):
+        self.ssl_context = kwargs.pop('ssl_context', None)
+        self.cipherSuite = kwargs.pop('cipherSuite', DEFAULT_CIPHER_SUITE)
+        self.source_address = kwargs.pop('source_address', None)
+        self.server_hostname = kwargs.pop('server_hostname', None)
+        self.ecdhCurve = kwargs.pop('ecdhCurve', DEFAULT_ECDH_CURVE)
+        if not self.ssl_context:
+            self.ssl_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+            self.ssl_context.orig_wrap_socket = self.ssl_context.wrap_socket
+            self.ssl_context.wrap_socket = self.wrap_socket
+        if self.server_hostname:
+            self.ssl_context.server_hostname = self.server_hostname
+        if self.cipherSuite:
+            self.ssl_context.set_ciphers(self.cipherSuite)
+            self.ssl_context.set_ecdh_curve(self.ecdhCurve)
+            self.ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
+            self.ssl_context.maximum_version = ssl.TLSVersion.TLSv1_3
+        super().__init__(*args, **kwargs)
+
+    def wrap_socket(self, *args, **kwargs):
+        if hasattr(self.ssl_context, 'server_hostname') and self.ssl_context.server_hostname:
+            kwargs['server_hostname'] = self.ssl_context.server_hostname
+            self.ssl_context.check_hostname = False
+        else:
+            self.ssl_context.check_hostname = True
+        return self.ssl_context.orig_wrap_socket(*args, **kwargs)
+
+    def init_poolmanager(self, *args, **kwargs):
+        kwargs['ssl_context'] = self.ssl_context
+        kwargs['source_address'] = self.source_address
+        return super().init_poolmanager(*args, **kwargs)
+
+
+class Browser(Session):
+    """جلسة HTTP مع TLS fingerprinting. مطابق لـ qx__1.py Browser."""
+
+    def __init__(self, *args, **kwargs):
+        self.response = None
+        self.default_headers = None
+        self.ecdhCurve = kwargs.pop('ecdhCurve', DEFAULT_ECDH_CURVE)
+        self.cipherSuite = kwargs.pop('cipherSuite', DEFAULT_CIPHER_SUITE)
+        self.source_address = kwargs.pop('source_address', None)
+        self.server_hostname = kwargs.pop('server_hostname', None)
+        _proxies = kwargs.pop('proxies', None)
+        super().__init__(*args, **kwargs)
+        self.proxies = _proxies or {}
+        self.headers.update(self.get_headers())
+        self.mount('https://', CipherSuiteAdapter(
+            ecdhCurve=self.ecdhCurve, cipherSuite=self.cipherSuite,
+            server_hostname=self.server_hostname, source_address=self.source_address,
+            ssl_context=ssl_context, max_retries=retry_strategy))
+
+    def __enter__(self): return self
+    def __exit__(self, exc_type, exc_val, exc_tb): self.close()
+    async def __aenter__(self): return self
+    async def __aexit__(self, exc_type, exc_val, exc_tb): self.__exit__(exc_type, exc_val, exc_tb)
+
+    def get_headers(self):
+        self.default_headers = {"User-Agent": USER_AGENT}
+        return self.default_headers
+
+    def set_headers(self, headers=None):
+        self.headers.update(self.default_headers)
+        if headers: self.headers.update(headers)
+
+    def get_cookies(self):
+        return '; '.join(f'{i.name}={i.value}' for i in self.cookies)
+
+    def get_soup(self):
+        if self.response and not self.response.ok:
+            raise RuntimeError(self.response.reason)
+        return BeautifulSoup(self.response.content, "html.parser")
+
+    def send_request(self, method, url, headers=None, **kwargs):
+        merged_headers = self.headers.copy()
+        if headers: merged_headers.update(headers)
+        if self.proxies: kwargs['proxies'] = self.proxies
+        self.response = self.request(method, url, headers=merged_headers, **kwargs)
+        return self.response
 
 
 # ==============================================================================
@@ -1279,259 +1384,333 @@ def is_token_expired(token: str, leeway_seconds: int = 30) -> bool:
 
 
 # ==============================================================================
-# SECTION 9.5: BROWSER LOGIN VIA PLAYWRIGHT (الإيميل + كلمة المرور)
+# SECTION 9.5: HTTP LOGIN (Browser-based, مطابق لـ qx__1.py)
 # ==============================================================================
 # نموذج تسجيل الدخول في https://binolla.com/login يحتوي على:
-#   - input[name="email"]     (type=text, id ديناميكي مثل :r0:)
-#   - input[name="password"]   (type=password, id ديناميكي مثل :r1:)
-#   - input[name="remember"]   (type=checkbox)
-#   - input[name="cf-turnstile-response"] (مخفي — Cloudflare CAPTCHA)
+#   - input[name="email"]     (type=text,    id ديناميكي مثل :r0:)
+#   - input[name="password"]  (type=password, id ديناميكي مثل :r1:)
+#   - input[name="remember"]  (type=checkbox)
+#   - input[name="cf-turnstile-response"]  (مخفي - Cloudflare CAPTCHA)
 #
-# النموذج لا يُرسل عبر HTML form تقليدي، بل عبر JavaScript fetch.
-# لذا نستخدم Playwright (متصفح Chromium حقيقي) لتعبئة الحقول والنقر على زر submit.
-# في حال ظهر Cloudflare Turnstile، نتركه للمستخدم ليحله يدوياً.
+# الصفحة React SPA، فلا يوجد <form action="..."> تقليدي.
+# الـ JS bundle يبني عنوان الـ API ديناميكياً، لذا نجرب عدة endpoints محتملة:
+#   /api/auth/login  /api/login  /api/v1/auth/login  /auth/login  /login
+#
+# نحاول:
+#   1) POST form-urlencoded (مثل qx__1.py تماماً)
+#   2) POST JSON  (fallback)
+# ونستخرج JWT من:
+#   - JSON response body
+#   - Set-Cookie header
+#   - redirect URL (Fragment)
+#   - HTML response (regex search)
 
-# أسماء مفاتيح localStorage المحتملة التي يخزّن فيها Binolla التوكن بعد الدخول
-_JWT_LS_KEYS = (
-    "token", "access_token", "auth_token", "authToken", "accessToken",
-    "jwt", "binolla_token", "bnn_token", "idToken",
+# endpoints محتملة لتسجيل الدخول إلى Binolla (تُجرّب بالترتيب)
+_LOGIN_ENDPOINTS = (
+    "/api/auth/login",
+    "/api/login",
+    "/api/v1/auth/login",
+    "/api/v1/login",
+    "/auth/login",
+    "/login",
 )
-# مفاتيح cookies المحتملة (HTTP-only غالباً، لكن نحاول)
+
+# أسماء مفاتيح JSON المحتملة التي قد يحملها الرد
+_JWT_JSON_KEYS = (
+    "token", "access_token", "auth_token", "authToken",
+    "accessToken", "jwt", "binolla_token", "bnn_token", "idToken",
+)
+
+# أسماء cookies المحتملة
 _JWT_COOKIE_NAMES = (
     "token", "access_token", "auth_token", "jwt",
     "bnn_token", "binolla_session",
 )
 
 
-async def login_via_browser(email: str, password: str, remember: bool = True,
-                            headless: bool = False,
-                            timeout: float = 180.0) -> Tuple[bool, str]:
-    """يفتح متصفح Chromium، يعبّئ نموذج Binolla، وينتظر نجاح الدخول.
+def _looks_like_jwt(s: str) -> bool:
+    """يتحقق هل النص يبدو JWT (header.payload.signature)."""
+    if not s or not isinstance(s, str):
+        return False
+    if s.count(".") != 2:
+        return False
+    if len(s) < 40:
+        return False
+    # حاول فك payload
+    try:
+        import base64 as _b64
+        pl = s.split(".")[1]
+        pl += "=" * (-len(pl) % 4)
+        decoded = _b64.urlsafe_b64decode(pl).decode("utf-8", errors="ignore")
+        d = json.loads(decoded)
+        return isinstance(d, dict) and ("iss" in d or "sub" in d or "aud" in d or "exp" in d)
+    except Exception:
+        return False
 
-    يجب تثبيت Playwright أولاً:
-        pip install playwright
-        playwright install chromium
 
-    المعاملات:
-      email    : إيميل المستخدم في Binolla
-      password : كلمة المرور
-      remember : تفعيل "تذكّرني"
-      headless : True للتشغيل بدون واجهة (لا يُنصح به لأن Turnstile قد يتطلب تفاعلاً)
-      timeout  : المهلة القصوى بالثواني
+class Login(Browser):
+    """تسجيل دخول HTTP إلى Binolla بنفس بنية qx__1.py Login.
 
-    يُعيد (True, "<JWT>") عند النجاح، أو (False, "<error_msg>") عند الفشل.
+    الاستخدام:
+        login = Login(api)
+        status, msg = await login(email, password)
     """
-    if not HAS_PLAYWRIGHT:
-        return (False,
-                "Playwright غير مُثبّت. ثبّته:\n"
-                "  pip install playwright\n"
-                "  playwright install chromium")
-    if not email or not password:
-        return False, "Email or password is empty."
+    base_url = HOST
+    https_base_url = ORIGIN_URL
+    login_url = f"{ORIGIN_URL}/login"
 
-    logmsg(f"{Colors.CYAN}Launching Chromium to log in to binolla.com...{Colors.RESET}")
-    logmsg(f"{Colors.DIM}If Cloudflare Turnstile appears, solve it manually.{Colors.RESET}")
+    def __init__(self, api, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.api = api
+        self.headers = self.get_headers()
+        # حافظ على رابط اللغة العربية إن اختار المستخدم
+        self.full_url = f"{self.https_base_url}/{getattr(api, 'lang', 'en')}"
 
-    try:
-        async with _async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=headless,
-                args=["--disable-blink-features=AutomationControlled"],
-            )
-            ctx = await browser.new_context(
-                user_agent=USER_AGENT,
-                viewport={"width": 1280, "height": 800},
-                locale="en-US",
-            )
-            # إخفاء webdriver flag
-            await ctx.add_init_script(
-                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-            )
-            page = await ctx.new_page()
+    def get_login_page(self) -> Optional[BeautifulSoup]:
+        """يحضر صفحة /login لاستخراج أي CSRF token أو cookies أولية."""
+        self.headers["Connection"] = "keep-alive"
+        self.headers["Accept-Encoding"] = "gzip, deflate, br"
+        self.headers["Accept-Language"] = "en-US,en;q=0.9,ar;q=0.8"
+        self.headers["Accept"] = ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+                                  "image/avif,image/webp,*/*;q=0.8")
+        self.headers["Referer"] = self.https_base_url + "/"
+        self.headers["Upgrade-Insecure-Requests"] = "1"
+        self.headers["Sec-Ch-Ua-Mobile"] = "?0"
+        self.headers["Sec-Ch-Ua-Platform"] = '"Windows"'
+        self.headers["Sec-Fetch-Site"] = "same-origin"
+        self.headers["Sec-Fetch-User"] = "?1"
+        self.headers["Sec-Fetch-Dest"] = "document"
+        self.headers["Sec-Fetch-Mode"] = "navigate"
+        self.headers["Dnt"] = "1"
+        try:
+            self.send_request("GET", self.login_url)
+            return self.get_soup()
+        except Exception as e:
+            logger.warning("GET /login failed: %s", e)
+            return None
 
-            # ---- 1) انتقل إلى صفحة الدخول ----
-            logmsg("→ Navigating to https://binolla.com/login ...")
+    def _extract_csrf(self, soup: Optional[BeautifulSoup]) -> Optional[str]:
+        """يستخرج CSRF token من meta tag أو input hidden."""
+        if not soup:
+            return None
+        # <meta name="csrf-token" content="...">
+        meta = soup.find("meta", {"name": "csrf-token"})
+        if meta and meta.get("content"):
+            return meta["content"]
+        # <input type="hidden" name="_token" value="...">
+        for name_attr in ("_token", "csrf_token", "csrf", "_csrf"):
+            inp = soup.find("input", {"name": name_attr})
+            if inp and inp.get("value"):
+                return inp["value"]
+        return None
+
+    def _extract_token_from_response(self) -> Optional[str]:
+        """يستخرج JWT من آخر استجابة HTTP."""
+        if not self.response:
+            return None
+
+        # 1) JSON response
+        ctype = self.response.headers.get("Content-Type", "").lower()
+        if "application/json" in ctype:
             try:
-                await page.goto("https://binolla.com/login",
-                               wait_until="domcontentloaded", timeout=45000)
-            except Exception as e:
-                await browser.close()
-                return False, f"Failed to load login page: {e}"
+                data = self.response.json()
+                if isinstance(data, dict):
+                    for key in _JWT_JSON_KEYS:
+                        val = data.get(key)
+                        if isinstance(val, str) and _looks_like_jwt(val):
+                            return val
+                    # قد يكون في payload متداخل
+                    for k1, v1 in data.items():
+                        if isinstance(v1, dict):
+                            for k2 in _JWT_JSON_KEYS:
+                                val = v1.get(k2)
+                                if isinstance(val, str) and _looks_like_jwt(val):
+                                    return val
+            except Exception:
+                pass
 
-            # ---- 2) انتظر حتى تظهر حقول النموذج (React rendering) ----
-            logmsg("→ Waiting for form fields to render...")
-            try:
-                await page.wait_for_selector('input[name="email"]', timeout=20000)
-                await page.wait_for_selector('input[name="password"]', timeout=20000)
-            except Exception as e:
-                await browser.close()
-                return False, f"Login form fields not found: {e}"
+        # 2) Set-Cookie
+        for c in self.cookies:
+            if c.name in _JWT_COOKIE_NAMES and _looks_like_jwt(c.value):
+                return c.value
 
-            # ---- 3) عبّئ الحقول باستخدام name= (لا id لأنه ديناميكي) ----
-            logmsg(f"→ Filling email: {email}")
-            await page.fill('input[name="email"]', email)
-            logmsg("→ Filling password: ***")
-            await page.fill('input[name="password"]', password)
+        # 3) HTML / JS في الرد (regex)
+        try:
+            body = self.response.text or ""
+            import re as _re
+            m = _re.search(r'["\']token["\']\s*:\s*["\']([^"\']{40,500})["\']', body)
+            if m and _looks_like_jwt(m.group(1)):
+                return m.group(1)
+        except Exception:
+            pass
 
-            # remember checkbox
-            if remember:
-                try:
-                    cb = await page.query_selector('input[name="remember"]')
-                    if cb is not None:
-                        is_checked = await cb.is_checked()
-                        if not is_checked:
-                            await cb.check()
-                except Exception as e:
-                    logger.debug("Could not tick 'remember': %s", e)
+        return None
 
-            logmsg(f"{Colors.YELLOW}→ Clicking 'Login' button...{Colors.RESET}")
-            logmsg(f"{Colors.DIM}  If Turnstile CAPTCHA appears, please solve it in the browser window.{Colors.RESET}")
-            logmsg(f"{Colors.DIM}  (The login button may be hidden behind the CAPTCHA widget until solved.){Colors.RESET}")
-
-            # ---- 4) انقر زر submit ----
-            # نحاول النقر العادي أولاً، ثم نعيد المحاولة بـ force=True
-            # لأن Cloudflare Turnstile قد يحجب الزر بصرياً.
-            submit_clicked = False
-            try:
-                # الأفضل: ابحث عن button[type="submit"] داخل النموذج
-                btn = await page.query_selector('form button[type="submit"]')
-                if btn is None:
-                    # احتياطي: أي زر يحتوي على نص "Log In" أو "Sign In"
-                    btn = await page.query_selector(
-                        'button:has-text("Log in"), button:has-text("Sign in"), '
-                        'button:has-text("Login"), button:has-text("Sign In")'
-                    )
-                if btn is not None:
-                    # انتظر 2 ثانية لـ Turnstile ليُحل تلقائياً أحياناً
-                    await asyncio.sleep(2.0)
-                    # محاولة 1: نقر عادي (مع مهلة قصيرة)
-                    try:
-                        await btn.click(timeout=5000)
-                        submit_clicked = True
-                    except Exception as click_err:
-                        logmsg(f"{Colors.DIM}  Normal click blocked (likely by Turnstile): "
-                               f"{str(click_err)[:80]}{Colors.RESET}")
-                        logmsg(f"{Colors.YELLOW}  Retrying with force=True...{Colors.RESET}")
-                        # محاولة 2: نقر مُجبر (يتجاهل حاجب overlay)
-                        try:
-                            await btn.click(force=True, timeout=5000)
-                            submit_clicked = True
-                        except Exception:
-                            # محاولة 3: إرسال Enter على حقل كلمة المرور
-                            logmsg(f"{Colors.DIM}  Force click also failed — pressing Enter on password field.{Colors.RESET}")
-                            await page.press('input[name="password"]', "Enter")
-                            submit_clicked = True
-                else:
-                    # احتياطي أخير: Enter في حقل كلمة المرور
-                    await page.press('input[name="password"]', "Enter")
-                    submit_clicked = True
-            except Exception as e:
-                await browser.close()
-                return False, f"Failed to submit login form: {e}"
-
-            if not submit_clicked:
-                await browser.close()
-                return False, "Could not find login submit button."
-
-            # ---- 5) انتظر إما لـ URL redirect أو لظهور JWT في localStorage ----
-            logmsg(f"→ Waiting up to {int(timeout)}s for login to complete...")
-            start = time.time()
-            token: Optional[str] = None
-            while time.time() - start < timeout:
-                # تحقق من تغيير الـ URL (الخروج من /login)
-                current_url = page.url
-                if "/login" not in current_url:
-                    # انتظر قليلاً ليكتمل تحميل الصفحة الجديدة
-                    await asyncio.sleep(2.0)
-                    logmsg(f"{Colors.GREEN}Redirected to {current_url}{Colors.RESET}")
-                    token = await _extract_jwt_from_browser(ctx, page)
-                    if token:
-                        break
-                # تحقق من localStorage حتى لو لم يتغير URL
-                token = await _extract_jwt_from_browser(ctx, page)
-                if token:
-                    break
-                await asyncio.sleep(1.0)
-
-            if not token:
-                # اعرض رسائل الخطأ إن وُجدت
-                try:
-                    err_el = await page.query_selector(
-                        '[class*="error" i], [class*="alert" i], [role="alert"]')
-                    if err_el is not None:
-                        err_text = (await err_el.text_content() or "").strip()
-                        if err_text:
-                            await browser.close()
-                            return False, f"Login failed: {err_text}"
-                except Exception:
-                    pass
-                await browser.close()
-                return False, "Login timed out — no JWT found."
-
-            logmsg(f"{Colors.GREEN}JWT extracted from browser.{Colors.RESET}")
-            await browser.close()
+    async def _post_form(self, data: Dict[str, Any], endpoint: str) -> Tuple[bool, str]:
+        """POST كـ form-urlencoded (مثل qx__1.py)."""
+        url = self.https_base_url + endpoint
+        self.headers["Content-Type"] = "application/x-www-form-urlencoded"
+        self.headers["Referer"] = self.login_url
+        self.headers["Origin"] = self.https_base_url
+        self.headers["Sec-Fetch-Site"] = "same-origin"
+        self.headers["Sec-Fetch-Mode"] = "cors"
+        self.headers["Sec-Fetch-Dest"] = "empty"
+        self.headers["Accept"] = "application/json, text/plain, */*"
+        self.headers["X-Requested-With"] = "XMLHttpRequest"
+        try:
+            self.send_request("POST", url, data=data)
+        except Exception as e:
+            return False, f"POST {endpoint} failed: {e}"
+        # تحقق من الرد
+        if self.response is None:
+            return False, f"No response from {endpoint}"
+        # Cloudflare challenge detection
+        body = self.response.text or ""
+        if self.response.status_code == 403 and "Just a moment" in body:
+            return False, (f"Cloudflare challenge at {endpoint} — HTTP login blocked "
+                          f"(need Turnstile CAPTCHA solved).")
+        if self.response.status_code >= 400:
+            return False, f"HTTP {self.response.status_code} from {endpoint}"
+        token = self._extract_token_from_response()
+        if token:
             return True, token
-    except Exception as e:
-        log_exception("login_via_browser", e)
-        return False, f"Browser login error: {e}"
+        return False, f"No JWT in response from {endpoint}"
+
+    async def _post_json(self, data: Dict[str, Any], endpoint: str) -> Tuple[bool, str]:
+        """POST كـ JSON (fallback لـ SPA endpoints)."""
+        url = self.https_base_url + endpoint
+        self.headers["Content-Type"] = "application/json"
+        self.headers["Referer"] = self.login_url
+        self.headers["Origin"] = self.https_base_url
+        self.headers["Sec-Fetch-Site"] = "same-origin"
+        self.headers["Sec-Fetch-Mode"] = "cors"
+        self.headers["Sec-Fetch-Dest"] = "empty"
+        self.headers["Accept"] = "application/json, text/plain, */*"
+        self.headers["X-Requested-With"] = "XMLHttpRequest"
+        try:
+            self.send_request("POST", url, json=data)
+        except Exception as e:
+            return False, f"POST (JSON) {endpoint} failed: {e}"
+        if self.response is None:
+            return False, f"No response from {endpoint}"
+        body = self.response.text or ""
+        if self.response.status_code == 403 and "Just a moment" in body:
+            return False, (f"Cloudflare challenge at {endpoint} — HTTP login blocked "
+                          f"(need Turnstile CAPTCHA solved).")
+        if self.response.status_code >= 400:
+            return False, f"HTTP {self.response.status_code} from {endpoint} (JSON)"
+        token = self._extract_token_from_response()
+        if token:
+            return True, token
+        return False, f"No JWT in JSON response from {endpoint}"
+
+    def success_login(self) -> Tuple[bool, str]:
+        """يتحقق من نجاح تسجيل الدخول بناءً على URL الرد (مثل qx__1.py)."""
+        if not self.response:
+            return False, "No response"
+        # بعد نجاح الدخول، يجب ألا يكون الـ URL ما زال على /login
+        url = str(self.response.url)
+        if "/login" in url and url.rstrip("/").endswith("/login"):
+            return False, "Still on /login — login failed."
+        return True, "Login successful."
+
+    async def __call__(self, username: str, password: str,
+                       user_data_dir: Optional[str] = None) -> Tuple[bool, str]:
+        """المُدخل الرئيسي: username=email, password.
+
+        يُعيد (True, "<JWT>") عند النجاح أو (False, "<error>") عند الفشل.
+        """
+        # 1) جلب /login لاستخراج CSRF والكوكيز
+        soup = self.get_login_page()
+        csrf = self._extract_csrf(soup)
+        logmsg(f"GET /login — CSRF token: {'found' if csrf else 'none'}")
+
+        # 2) بناء حمولة النموذج (مطابقة لـ qx__1.py + حقول Binolla)
+        form_data = {
+            "email": username,
+            "password": password,
+            "remember": "on",  # checkbox value
+        }
+        if csrf:
+            form_data["_token"] = csrf
+
+        # 3) جرّب POST كـ form-urlencoded على كل endpoint
+        last_err = ""
+        for ep in _LOGIN_ENDPOINTS:
+            logmsg(f"Trying POST (form) {ep} ...")
+            ok, msg = await self._post_form(form_data, ep)
+            if ok:
+                # نجاح
+                self.cookies_str = self.get_cookies()
+                self.api.session_data["cookies"] = self.cookies_str
+                self.api.session_data["token"] = msg
+                self.api.session_data["user_agent"] = self.headers["User-Agent"]
+                return True, msg
+            last_err = msg
+            # إذا Cloudflare challenge، لا فائدة من المحاولة على endpoints أخرى
+            if "Cloudflare" in msg:
+                break
+
+        # 4) جرّب POST كـ JSON على كل endpoint (fallback)
+        if "Cloudflare" not in last_err:
+            json_payload = {
+                "email": username,
+                "password": password,
+                "remember": True,
+            }
+            for ep in _LOGIN_ENDPOINTS:
+                logmsg(f"Trying POST (JSON) {ep} ...")
+                ok, msg = await self._post_json(json_payload, ep)
+                if ok:
+                    self.cookies_str = self.get_cookies()
+                    self.api.session_data["cookies"] = self.cookies_str
+                    self.api.session_data["token"] = msg
+                    self.api.session_data["user_agent"] = self.headers["User-Agent"]
+                    return True, msg
+                last_err = msg
+                if "Cloudflare" in msg:
+                    break
+
+        return False, last_err or "Login failed. Invalid email or password."
 
 
-async def _extract_jwt_from_browser(ctx, page) -> Optional[str]:
-    """يستخرج JWT من localStorage أو cookies في السياق الحالي."""
-    # 1) localStorage
-    try:
-        for key in _JWT_LS_KEYS:
-            val = await page.evaluate(
-                "(k) => localStorage.getItem(k)", key
-            )
-            if val and val.count(".") == 2 and len(val) > 40:
-                # تأكد أنه JWT بصيغة header.payload.signature
-                return val
-    except Exception as e:
-        logger.debug("localStorage read error: %s", e)
+class Settings(Browser):
+    """يجلب إعدادات الحساب من /api/state و /api/dictionaries. مطابق لـ qx__1.py Settings."""
 
-    # 1.5) ابحث في كل مفاتيح localStorage عن أي قيمة تبدو JWT
-    try:
-        all_vals = await page.evaluate(
-            """() => {
-                const out = {};
-                for (let i = 0; i < localStorage.length; i++) {
-                    const k = localStorage.key(i);
-                    out[k] = localStorage.getItem(k);
-                }
-                return out;
-            }"""
-        )
-        if isinstance(all_vals, dict):
-            for k, v in all_vals.items():
-                if isinstance(v, str) and v.count(".") == 2 and len(v) > 40:
-                    # تحقق من أن فك base64 للـ payload يعطي JSON
-                    try:
-                        import base64 as _b64
-                        pl = v.split(".")[1]
-                        pl += "=" * (-len(pl) % 4)
-                        decoded = _b64.urlsafe_b64decode(pl).decode("utf-8", errors="ignore")
-                        d = json.loads(decoded)
-                        if isinstance(d, dict) and ("iss" in d or "sub" in d or "aud" in d):
-                            logmsg(f"  {Colors.DIM}Found JWT in localStorage key: '{k}'{Colors.RESET}")
-                            return v
-                    except Exception:
-                        continue
-    except Exception as e:
-        logger.debug("localStorage scan error: %s", e)
+    def __init__(self, api):
+        proxies_dict = api._normalize_proxies(api.proxies) if hasattr(api, '_normalize_proxies') else None
+        super().__init__(proxies=proxies_dict)
+        self.set_headers()
+        self.api = api
+        self.headers = self.get_headers()
 
-    # 2) Cookies (HTTP-only لا تظهر من JS، لكن Playwright يصل إليها)
-    try:
-        cookies = await ctx.cookies()
-        for c in cookies:
-            if c.get("name") in _JWT_COOKIE_NAMES:
-                val = c.get("value", "")
-                if val and val.count(".") == 2 and len(val) > 40:
-                    return val
-    except Exception as e:
-        logger.debug("Cookies read error: %s", e)
+    def get_settings(self):
+        """يجلب /api/state — يحتوي على حالة الحساب بعد الدخول."""
+        self.headers["content-type"] = "application/json"
+        self.headers["referer"] = self.api.https_url + "/"
+        self.headers["cookie"] = self.api.session_data.get("cookies", "")
+        self.headers["user-agent"] = self.api.session_data.get("user_agent", "")
+        self.headers["authorization"] = f'Bearer {self.api.session_data.get("token", "")}'
+        try:
+            r = self.send_request("GET", f"{self.api.https_url}/api/state")
+            if r and r.status_code == 200:
+                return r.json()
+        except Exception as e:
+            logger.warning("GET /api/state failed: %s", e)
+        return None
 
-    return None
+    def get_dictionaries(self):
+        """يجلب /api/dictionaries — قائمة الأصول والمعلومات المرجعية."""
+        self.headers["content-type"] = "application/json"
+        self.headers["cookie"] = self.api.session_data.get("cookies", "")
+        self.headers["user-agent"] = self.api.session_data.get("user_agent", "")
+        try:
+            r = self.send_request("GET", f"{self.api.https_url}/api/dictionaries")
+            if r and r.status_code == 200:
+                return r.json()
+        except Exception as e:
+            logger.warning("GET /api/dictionaries failed: %s", e)
+        return None
 
 
 # ==============================================================================
@@ -1689,15 +1868,19 @@ async def ainput(prompt: str = "") -> str:
 
 def print_banner() -> None:
     banner = r"""
- ____  _ _ _                     _
-| __ _) (_) | |_ ___ ___ _ _ _ _| |_ ___
-| _ \ \| | |  _/ -_) -_) '_| ' \  _(_-<
-|___/|_|_|\__\__\__\___|_| |_| |_||/__/
-        Binolla WebSocket API  |  bn__1.py
+============================================================
+  BINOLLA - Binolla Candle Fetcher
+  Simplified version: fetch candles and save as JSON
+============================================================
+  WebSocket : wss://ws3.binolla.com/socket.io/?EIO=4
+  Login    : https://binolla.com/login
+             (input[name="email"], input[name="password"],
+              input[name="remember"])
+  Speed    : 5 parallel workers
+  Timeframes: 1, 5, 15, 30, 60 (minutes)
+============================================================
 """
     print(f"{Colors.CYAN}{banner}{Colors.RESET}")
-    print(f"  {Colors.DIM}EIO=4 / Socket.IO v4 — JWT auth — Binary events{Colors.RESET}")
-    print()
 
 
 async def prompt_token() -> Optional[str]:
@@ -1879,13 +2062,6 @@ async def main_async():
     args = parse_args()
     print_banner()
 
-    # تحقق من Playwright متاح (للعرض رسالة دائمة واحدة)
-    if not HAS_PLAYWRIGHT:
-        logmsg(f"{Colors.YELLOW}Note: Playwright not installed — email/password login "
-               f"will be unavailable.{Colors.RESET}")
-        logmsg(f"{Colors.DIM}  To enable: pip install playwright && playwright install chromium"
-               f"{Colors.RESET}")
-
     # ===== 1) حدّد طريقة المصادقة =====
     token = args["token"]
     email = args["email"]
@@ -1969,18 +2145,41 @@ async def main_async():
         if not email:
             return
 
-    # ===== 2) إن وُجد إيميل/كلمة مرور (ولم يُمرّر JWT) — سجّل الدخول عبر المتصفح =====
+    # ===== 2) إن وُجد إيميل/كلمة مرور (ولم يُمرّر JWT) — سجّل الدخول عبر HTTP =====
     if email and password and not token:
-        logmsg(f"Logging in as {email} via Playwright browser...")
-        ok, jwt_or_err = await login_via_browser(
-            email=email, password=password, remember=True,
-            headless=args["headless"], timeout=180.0,
+        logmsg(f"Logging in as {email} via HTTP (qx__1.py-style)...")
+        # أنشئ كائن Login مرتبط بـ API وهمي (سنبني API الحقيقي بعد استخراج التوكن)
+        from types import SimpleNamespace
+        proxy_dict = None
+        if args["proxies"]:
+            from urllib.parse import urlparse
+            p = urlparse(args["proxies"])
+            if p.hostname and p.port:
+                proxy_dict = {"http": args["proxies"], "https": args["proxies"]}
+        login_api = SimpleNamespace(
+            host=HOST, https_url=ORIGIN_URL, lang="en",
+            session_data={"user_agent": USER_AGENT, "cookies": ""},
+            _normalize_proxies=staticmethod(lambda x: {"http": x, "https": x} if x else None)
+            if False else (lambda x: {"http": x, "https": x} if x else None),
+            proxies=args["proxies"] or None,
         )
+        login = Login(login_api, proxies=proxy_dict)
+        try:
+            ok, jwt_or_err = await login(email, password)
+        except Exception as e:
+            ok, jwt_or_err = False, f"HTTP login exception: {e}"
         if not ok:
-            print(f"{Colors.RED}Browser login failed: {jwt_or_err}{Colors.RESET}")
-            return
-        token = jwt_or_err
-        logmsg(f"{Colors.GREEN}Got fresh JWT from Binolla.{Colors.RESET}")
+            print(f"{Colors.RED}HTTP login failed: {jwt_or_err}{Colors.RESET}")
+            print(f"{Colors.YELLOW}Hint: Binolla uses Cloudflare Turnstile on /login.{Colors.RESET}")
+            print(f"{Colors.YELLOW}      If HTTP login fails, paste a JWT manually (extract from DevTools → "
+                  f"Application → Local Storage → 'token' key).{Colors.RESET}")
+            # Fallback: اطلب JWT يدوياً
+            token = await prompt_token()
+            if token is None:
+                return
+        else:
+            token = jwt_or_err
+            logmsg(f"{Colors.GREEN}Got JWT from HTTP login.{Colors.RESET}")
 
     if not token:
         print(f"{Colors.RED}No token available.{Colors.RESET}")
@@ -1990,13 +2189,24 @@ async def main_async():
     if is_token_expired(token):
         print(f"{Colors.YELLOW}Warning: JWT appears expired. WebSocket auth may fail.{Colors.RESET}")
         if email and password:
-            logmsg("Re-logging in via browser...")
-            ok, jwt_or_err = await login_via_browser(
-                email=email, password=password, remember=True,
-                headless=args["headless"], timeout=180.0,
+            logmsg("Re-logging in via HTTP...")
+            from types import SimpleNamespace
+            proxy_dict = None
+            if args["proxies"]:
+                proxy_dict = {"http": args["proxies"], "https": args["proxies"]}
+            login_api = SimpleNamespace(
+                host=HOST, https_url=ORIGIN_URL, lang="en",
+                session_data={"user_agent": USER_AGENT, "cookies": ""},
+                _normalize_proxies=(lambda x: {"http": x, "https": x} if x else None),
+                proxies=args["proxies"] or None,
             )
-            if ok:
-                token = jwt_or_err
+            login = Login(login_api, proxies=proxy_dict)
+            try:
+                ok, jwt_or_err = await login(email, password)
+                if ok:
+                    token = jwt_or_err
+            except Exception:
+                pass
 
     # ===== 3) نوع الحساب =====
     if not args["non_interactive"]:
