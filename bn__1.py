@@ -2519,20 +2519,9 @@ async def main_async():
     stop_keepalive = asyncio.Event()
     keepalive_task = asyncio.create_task(keepalive_loop(client, stop_keepalive))
 
-    # جلب أولي للمعلومات
-    logmsg("Fetching initial data (assets, balances, settings)...")
-    try:
-        assets = await asyncio.wait_for(client.api.get_assets_async(), timeout=10)
-        balances = await asyncio.wait_for(client.api.get_balances_async(), timeout=10)
-        settings = await asyncio.wait_for(client.api.get_settings_async(), timeout=10)
-        print(f"  {Colors.CYAN}Assets count :{Colors.RESET} "
-              f"{_count_items(assets)}")
-        print(f"  {Colors.CYAN}Balances    :{Colors.RESET} "
-              f"{_format_balances(balances)}")
-        print(f"  {Colors.CYAN}Settings    :{Colors.RESET} "
-              f"{_summary(settings)}")
-    except Exception as e:
-        logmsg(f"Initial fetch failed: {e}")
+    # ملاحظة: لا نُرسل طلبات أولية إضافية — الخادم يُرسل تلقائياً بعد المصادقة:
+    #   s_assets/list, s_settings/list, s_balances/list, s_history/last, s_quotes/list
+    # ننتظر مباشرةً إدخال المستخدم لاسم العملة والفريم وعدد الأيام.
 
     try:
         fetch_count = 0
