@@ -582,7 +582,24 @@ class BinollaWebsocketClient:
 
     def _console_msg(self, direction: str, kind: str, length: int,
                       ts: str, content: str) -> None:
-        """يطبع رسالة WS على الـ console بألوان مميّزة (مقتطعة لـ 250 حرف)."""
+        """يطبع رسالة WS على الـ console بألوان مميّزة (مقتطعة لـ 250 حرف).
+
+        نرشّح بعض الرسائل المُزعجة (live ticks, periodic re-pushes) لكي
+        لا تُغرق الـ console أثناء انتظار إدخال المستخدم لاسم العملة.
+        """
+        # رشّح الرسائل المُزعجة (تُسجّل في الملف لكن لا تُطبع على الـ console)
+        # 1) s_quotes/list — live ticks كل ~300ms (يُغرق الـ console)
+        # 2) s_assets/list — re-pushed كل ~20s
+        # 3) Engine.IO PING/PONG ("2" / "3")
+        head = content[:120] if content else ""
+        if "s_quotes/list" in head:
+            return
+        if "s_assets/list" in head and direction == "←":
+            # اطبع أول مرة فقط (طويل binary) لكن لا تكرر
+            return
+        if content in ("2", "3"):
+            return  # Engine.IO PING/PONG
+
         # اختصر المحتوى المعروض على الـ console لمنع الفيض
         max_console = 250
         if len(content) > max_console:
