@@ -874,8 +874,14 @@ class BinollaWebsocketClient:
                             self.api.event_registry.set_event(
                                 f's_history/region_{index}', payload),
                             loop)
-                    logger.info("s_history/region received (index=%s, payload size=%d bytes)",
-                                index, len(str(payload)[:200]))
+                    # سجّل تفاصيل الـ payload (الطول الفعلي + أول 500 حرف للهيكلة)
+                    payload_str = str(payload)
+                    payload_len = len(payload_str)
+                    payload_preview = payload_str[:500]
+                    logger.info("s_history/region received (index=%s, payload_size=%d chars)",
+                                index, payload_len)
+                    logmsg(f"{Colors.DIM}s_history/region index={index} size={payload_len} chars "
+                           f"preview: {payload_preview}{Colors.RESET}")
                 else:
                     logger.warning("s_history/region: no index field found in payload")
             except Exception as e:
@@ -1476,7 +1482,7 @@ class Binolla:
                         continue
                     consecutive_failures = 0
                     # حوّل الـ payload إلى شموع
-                    new_batch = self._parse_history(result)
+                    new_batch = self._parse_history(result, period_min=timeframe_min)
                     if not new_batch:
                         oldest_t -= chunk_seconds
                         continue
@@ -1512,48 +1518,90 @@ class Binolla:
         # رتّب حسب time
         return sorted(all_candles.values(), key=lambda x: x['time'])
 
-    def _parse_history(self, payload: Any) -> List[Dict]:
+    def _parse_history(self, payload: Any, period_min: int = 1) -> List[Dict]:
         """يُحوّل payload الـ s_history/region إلى قائمة شموع بصيغة OHLC.
 
-        يدعم عدة بنى محتملة:
-          1) {"index":..., "asset":..., "candles":[[time, OHLC, ...], ...]}
-          2) {"index":..., "candles":[{"time":..., "open":..., ...}, ...]}
-          3) {"data":{"candles":[...]}}
+        Binolla يُرسل **ticks** وليس OHLC candles. كل tick = [timestamp, price, direction].
+        لذا نجمع الـ ticks إلى شموع حسب الفريم المطلوب:
+          - period_min=1  → شمعة لكل دقيقة (60 ثانية)
+          - period_min=5  → شمعة لكل 5 دقائق (300 ثانية)
+          - period_min=15 → شمعة لكل 15 دقيقة (900 ثانية)
+          ... إلخ
+
+        صيغ الـ payload المدعومة:
+          1) {"asset":..., "period":..., "history":[[ts, price, dir], ...]}  ← Binolla tick format
+          2) {"index":..., "candles":[[time, open, close, high, low, vol], ...]}  ← Quotex-style
+          3) {"index":..., "candles":[{"time","open",...}, ...]}
           4) [[time, open, close, high, low, vol], ...]
         """
         if not payload:
             return []
-        # استخرج candles من payload
-        candles = None
+
+        # استخرج candles/ticks من payload
+        ticks_or_candles = None
+        period_from_payload = None
         if isinstance(payload, dict):
-            candles = (payload.get("candles") or payload.get("data")
-                       or payload.get("history") or payload.get("list"))
-            # قد تكون candles داخل "data" sub-dict
-            if candles is None and isinstance(payload.get("data"), dict):
-                candles = (payload["data"].get("candles")
-                           or payload["data"].get("data") or [])
+            ticks_or_candles = (payload.get("history") or payload.get("candles")
+                                or payload.get("data") or payload.get("list"))
+            period_from_payload = payload.get("period")
+            if ticks_or_candles is None and isinstance(payload.get("data"), dict):
+                ticks_or_candles = (payload["data"].get("candles")
+                                     or payload["data"].get("history") or [])
         elif isinstance(payload, list):
-            candles = payload
+            ticks_or_candles = payload
         else:
             return []
-        if not candles:
+        if not ticks_or_candles:
             return []
 
+        # استخدم الفريم من الـ payload إن وُجد، وإلا استخدم period_min المُمرّر
+        actual_period = period_min
+        if isinstance(period_from_payload, (int, float)) and period_from_payload > 0:
+            actual_period = int(period_from_payload)
+        period_sec = actual_period * 60  # ثانية لكل شمعة
+
+        # اكتشف الصيغة: ticks أو candles؟
+        # Tick: [timestamp, price, direction]  → len=3 وعنصرين رقميين
+        # Candle: [time, open, close, high, low, vol]  → len=5-6
+        first = ticks_or_candles[0] if isinstance(ticks_or_candles, list) else None
+        if isinstance(first, dict):
+            # صيغة dict للشموع: {"time","open","high","low","close",...}
+            return self._parse_candle_dicts(ticks_or_candles)
+        if isinstance(first, list):
+            if len(first) >= 5:
+                # صيغة OHLC list: [time, open, close, high, low, vol]
+                return self._parse_candle_lists(ticks_or_candles)
+            elif len(first) >= 2:
+                # صيغة tick: [timestamp, price, direction?]
+                return self._aggregate_ticks_to_candles(ticks_or_candles, period_sec)
+        # إذا وصلنا هنا، فالصيغة غير معروفة
+        logger.warning("Unknown history payload format. First item: %s", str(first)[:200])
+        return []
+
+    def _parse_candle_dicts(self, candles: List[Dict]) -> List[Dict]:
+        """يحلّل صيغة {time, open, high, low, close, volume}."""
         parsed = []
         for c in candles:
             try:
-                if isinstance(c, dict):
-                    t = int(c.get("time", c.get("timestamp", 0)) or 0)
-                    o = float(c.get("open", 0) or 0)
-                    h = float(c.get("high", c.get("max", 0)) or 0)
-                    l = float(c.get("low", c.get("min", 0)) or 0)
-                    cl = float(c.get("close", 0) or 0)
-                    v = float(c.get("volume", 0) or 0)
-                    if t > 0:
-                        parsed.append({"time": t, "open": o, "high": h,
-                                       "low": l, "close": cl, "volume": v})
-                elif isinstance(c, list) and len(c) >= 5:
-                    # صيغة Quotex الشائعة: [time, open, close, high, low, volume]
+                t = int(c.get("time", c.get("timestamp", 0)) or 0)
+                o = float(c.get("open", 0) or 0)
+                h = float(c.get("high", c.get("max", 0)) or 0)
+                l = float(c.get("low", c.get("min", 0)) or 0)
+                cl = float(c.get("close", 0) or 0)
+                v = float(c.get("volume", 0) or 0)
+                if t > 0:
+                    parsed.append({"time": t, "open": o, "high": h,
+                                   "low": l, "close": cl, "volume": v})
+            except Exception:
+                continue
+        return parsed
+
+    def _parse_candle_lists(self, candles: List[List]) -> List[Dict]:
+        """يحلّل صيغة [time, open, close, high, low, volume] (Quotex-style)."""
+        parsed = []
+        for c in candles:
+            try:
+                if len(c) >= 5:
                     parsed.append({
                         "time": int(c[0]), "open": float(c[1]),
                         "high": float(c[3]), "low": float(c[4]),
@@ -1563,6 +1611,50 @@ class Binolla:
             except Exception:
                 continue
         return parsed
+
+    def _aggregate_ticks_to_candles(self, ticks: List[List],
+                                      period_sec: int) -> List[Dict]:
+        """يجمع ticks بصيغة [timestamp, price, direction] إلى شموع OHLC.
+
+        لكل فترة (period_sec ثانية):
+          - open  = أول tick price في الفترة
+          - high  = أقصى price في الفترة
+          - low   = أدنى price في الفترة
+          - close = آخر tick price في الفترة
+          - volume = عدد الـ ticks في الفترة
+          - time  = بداية الفترة (floor timestamp إلى period_sec)
+        """
+        if not ticks:
+            return []
+        # جمّع الـ ticks حسب bucket = floor(timestamp / period_sec)
+        buckets: Dict[int, List[float]] = {}
+        for tick in ticks:
+            try:
+                if len(tick) < 2:
+                    continue
+                ts = float(tick[0])
+                price = float(tick[1])
+                bucket = int(ts // period_sec) * period_sec
+                if bucket not in buckets:
+                    buckets[bucket] = []
+                buckets[bucket].append(price)
+            except Exception:
+                continue
+        # حوّل كل bucket إلى شمعة OHLC
+        candles = []
+        for bucket_time in sorted(buckets.keys()):
+            prices = buckets[bucket_time]
+            if not prices:
+                continue
+            candles.append({
+                "time": bucket_time,
+                "open": prices[0],
+                "high": max(prices),
+                "low": min(prices),
+                "close": prices[-1],
+                "volume": float(len(prices)),
+            })
+        return candles
 
     async def close(self) -> bool:
         if self.api:
