@@ -1004,9 +1004,10 @@ class BinollaAPI:
             # في EIO=4 لا نُفعّل WS-level ping — الخادم يُرسل Engine.IO PING ("2")
             # كل 25 ثانية، ونردّ بـ "3" داخل on_message. لو فعّلنا ping_interval هنا،
             # مكتبة websocket-client ستُرسل WS PING frames (مستوى RFC 6455) وقد
-            # تُربك خادم Socket.IO. نُبقيها معطّلة (0).
+            # تُربك خادم Socket.IO. نُبقي ping_interval=0 (معطّل) و ping_timeout=30
+            # (قيمة افتراضية — المكتبة تتطلبها >0 حتى لو كان ping_interval=0).
             "ping_interval": 0,
-            "ping_timeout": 0,
+            "ping_timeout": 30,
             "origin": ORIGIN_URL,
             "host": WS_HOST,
             "sslopt": {
