@@ -467,6 +467,10 @@ def _safe_json_loads(s: Union[str, bytes]) -> Any:
 class BinollaWebsocketClient:
     """عميل WebSocket لمنصة Binolla مع دعم الرسائل الثنائية."""
 
+    # ملف تسجيل كل رسائل WebSocket (واردة + صادرة) — يُفتح lazily
+    _ws_log_file = None
+    _ws_log_path: Optional[Path] = None
+
     def __init__(self, api: "BinollaAPI"):
         self.api = api
         self.state = api.state
@@ -488,16 +492,89 @@ class BinollaWebsocketClient:
         )
 
         # ----- حالة استقبال الرسائل الثنائية -----
-        # عندما يصل us a `45N-<json>` text packet:
-        #   نُخزّنه هنا مع عدد الـ attachments المتوقّعة،
-        #   ثم نبدأ بجمع الإطارات الثنائية التالية ونُوزّعها على الـ placeholders.
         self._binary_packet_queue: List[Dict] = []
-        # كل عنصر = {"parts": [json_obj], "expected": N, "received": 0}
 
         # إعدادات heartbeat
-        self._ping_interval = 25.0  # ثانية (يُحدّث من رسالة 0{...})
+        self._ping_interval = 25.0
         self._ping_timeout = 20.0
         self._last_server_ping_at: float = time.time()
+
+        # ----- ملف تسجيل كامل لكل رسائل WebSocket -----
+        # اسم الملف يضمّن timestamp البدء حتى لا تُكتب فوقه جلسات سابقة
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        BinollaWebsocketClient._ws_log_path = Path(f"ws_messages_{ts}.log")
+        try:
+            BinollaWebsocketClient._ws_log_file = open(
+                BinollaWebsocketClient._ws_log_path, "a", encoding="utf-8")
+            self._ws_log_write(f"# WebSocket session log — started at {datetime.now().isoformat()}\n"
+                               f"# WSS URL: {WSS_URL}\n"
+                               f"# Origin:  {ORIGIN_URL}\n"
+                               f"# Token:   {(self.state.SSID or '')[:40]}...\n"
+                               f"# Format:  DIR | LEN | TIME | RAW (or hex for binary)\n"
+                               f"# DIR: ← = received from server, → = sent to server\n"
+                               f"# ===========================================================\n")
+            logmsg(f"{Colors.CYAN}WS message log: {BinollaWebsocketClient._ws_log_path.absolute()}{Colors.RESET}")
+        except Exception as e:
+            logger.warning("Could not open WS log file: %s", e)
+
+    @classmethod
+    def _ws_log_write(cls, line: str) -> None:
+        """يكتب سطراً في ملف سجل WebSocket (thread-safe بشكل بسيط)."""
+        if cls._ws_log_file is None:
+            return
+        try:
+            cls._ws_log_file.write(line)
+            cls._ws_log_file.flush()
+        except Exception:
+            pass
+
+    def _log_incoming(self, msg) -> None:
+        """يسجل رسالة واردة من الخادم."""
+        ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        if isinstance(msg, (bytes, bytearray)):
+            data = bytes(msg)
+            # جرب JSON decode للـ binary packets
+            try:
+                decoded = data.decode("utf-8", errors="ignore")
+                # إن كان JSON واضح، اعرضه كـ JSON
+                if decoded and decoded[0] in '[{':
+                    self._ws_log_write(f"← BIN {len(data):6d} {ts} {decoded[:5000]}\n")
+                    return
+            except Exception:
+                pass
+            # وإلا، اعرض الـ hex أول 200 بايت
+            hex_preview = data[:200].hex()
+            self._ws_log_write(f"← BIN {len(data):6d} {ts} hex={hex_preview}\n")
+            # اعرض ASCII إن أمكن
+            try:
+                ascii_preview = data[:500].decode("utf-8", errors="replace")
+                self._ws_log_write(f"         ascii={ascii_preview}\n")
+            except Exception:
+                pass
+        else:
+            text = msg.decode("utf-8", errors="ignore") if isinstance(msg, bytes) else str(msg)
+            # اقتطاع الرسائل الطويلة جداً (مع وضع علامة)
+            preview = text if len(text) <= 5000 else text[:5000] + f"... [truncated, total={len(text)}]"
+            self._ws_log_write(f"← TXT {len(text):6d} {ts} {preview}\n")
+
+    def _log_outgoing(self, data) -> None:
+        """يسجل رسالة صادرة من العميل."""
+        ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        if isinstance(data, (bytes, bytearray)):
+            d = bytes(data)
+            try:
+                decoded = d.decode("utf-8", errors="ignore")
+                if decoded and decoded[0] in '[{012345"':
+                    self._ws_log_write(f"→ BIN {len(d):6d} {ts} {decoded[:5000]}\n")
+                    return
+            except Exception:
+                pass
+            hex_preview = d[:200].hex()
+            self._ws_log_write(f"→ BIN {len(d):6d} {ts} hex={hex_preview}\n")
+        else:
+            text = str(data)
+            preview = text if len(text) <= 5000 else text[:5000] + f"... [truncated, total={len(text)}]"
+            self._ws_log_write(f"→ TXT {len(text):6d} {ts} {preview}\n")
 
     # ---- on_open: يُرسل بعد فتح قناة WebSocket -----
     def on_open(self, wss):
@@ -510,6 +587,12 @@ class BinollaWebsocketClient:
 
     # ---- on_message: قلب المعالج -----
     def on_message(self, wss, msg):
+        # سجلّ الرسالة الواردة (text أو binary) في ملف السجل
+        try:
+            self._log_incoming(msg)
+        except Exception:
+            pass
+
         self.state.ssl_Mutual_exclusion = True
         try:
             if self.api is not None:
@@ -605,6 +688,7 @@ class BinollaWebsocketClient:
         # للانضمام إلى namespace الافتراضي "/".
         # الخادم سيردّ بـ 40{"sid":"..."} (CONNECT_ACK) ثم نكمل المصادقة.
         try:
+            self._log_outgoing("40")
             self.wss.send("40")
             logger.info("Sent Socket.IO CONNECT (40).")
         except Exception as e:
@@ -814,6 +898,7 @@ class BinollaWebsocketClient:
         }
         data = '42["authorization",' + json.dumps(payload, separators=(",", ":")) + ']'
         try:
+            self._log_outgoing(data)
             self.wss.send(data)
             logger.info("Authorization sent (token=%s...).", token[:24])
             logmsg("Sent authorization frame to Binolla server...")
@@ -827,17 +912,21 @@ class BinollaWebsocketClient:
         """يرسل الطلبات الأولية بعد تأكيد المصادقة (يطابق الترتيب المُلتقط)."""
         try:
             # 1) الطلبات النصية (تُرجع data ثنائية عبر s_*)
-            self.wss.send('42["orders/opened/list"]')
-            self.wss.send('42["orders/closed/list"]')
-            self.wss.send('42["assets/list"]')
-            self.wss.send('42["alert/list"]')
-            self.wss.send('42["alert/closed/list"]')
-            self.wss.send('42["indicator/list"]')
-            self.wss.send('42["drawing/load"]')
-            self.wss.send('42["balances/list"]')
-            self.wss.send('42["settings/list"]')
-            self.wss.send('42["history/last"]')
-            self.wss.send('42["quotes/list"]')
+            for msg in (
+                '42["orders/opened/list"]',
+                '42["orders/closed/list"]',
+                '42["assets/list"]',
+                '42["alert/list"]',
+                '42["alert/closed/list"]',
+                '42["indicator/list"]',
+                '42["drawing/load"]',
+                '42["balances/list"]',
+                '42["settings/list"]',
+                '42["history/last"]',
+                '42["quotes/list"]',
+            ):
+                self._log_outgoing(msg)
+                self.wss.send(msg)
 
             # 2) تغيير الأصل الافتراضي
             asset = self.api.current_asset or "EURUSD_otc"
@@ -845,6 +934,7 @@ class BinollaWebsocketClient:
             change_payload = [{"asset": asset, "period": period}]
             data = '42["asset/list/change",' + json.dumps(change_payload,
                                                           separators=(",", ":")) + ']'
+            self._log_outgoing(data)
             self.wss.send(data)
 
             logger.info("Post-auth subscriptions sent (asset=%s, period=%s).", asset, period)
@@ -975,6 +1065,11 @@ class BinollaAPI:
         self.state.ssl_Mutual_exclusion_write = True
         try:
             if self.websocket_client and self.websocket_client.wss:
+                # سجلّ الرسالة الصادرة قبل الإرسال
+                try:
+                    self.websocket_client._log_outgoing(data)
+                except Exception:
+                    pass
                 self.websocket_client.wss.send(data)
         finally:
             self.state.ssl_Mutual_exclusion_write = False
