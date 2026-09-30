@@ -9,15 +9,19 @@ BINOLLA — Binolla WebSocket API Client (نسخة مبسّطة)
     wss://ws3.binolla.com/socket.io/?EIO=4&transport=websocket
 
 يدعم:
-  - مصادقة JWT مباشرة (بدون HTTP login، يكفي تمرير الـ token).
+  - **طريقتان للمصادقة**:
+    (أ) JWT token مباشرة (يُستخرج يدوياً من Local Storage في المتصفح).
+    (ب) تسجيل دخول بالإيميل وكلمة المرور عبر Playwright (متصفح Chromium)
+        — يفتح https://binolla.com/login، يعبّئ input[name="email"] و
+        input[name="password"] و input[name="remember"] تلقائياً،
+        ثم ينتظر من المستخدم حل Cloudflare Turnstile CAPTCHA إن ظهرت.
+        بعد نجاح الدخول يُستخرج JWT من Local Storage تلقائياً.
   - استلام الرسائل الثنائية (binary events بصيغة 451-[...]).
   - جلب: الأصول، الأرصدة، الإعدادات، الطلبات المفتوحة/المغلقة،
     التنبيهات، الشموع التاريخية، الاقتباسات اللحظية (quotes).
   - تغيير الأصل والفريم عبر asset/list/change.
   - وضع صفقات (binary options) عبر orders/open.
-  - حفظ التوكن والبيانات محلياً.
-
-مبني على نفس بنية qx__1.py (Quotex) مع تعديلات لبروتوكول EIO=4.
+  - حفظ التوكن والإيميل/كلمة المرور محلياً.
 
 البروتوكول باختصار:
   - 0{...}        Engine.IO OPEN  (sid, pingInterval=25s, pingTimeout=20s)
@@ -29,12 +33,21 @@ BINOLLA — Binolla WebSocket API Client (نسخة مبسّطة)
   - 2 / 3         Engine.IO PING / PONG (الخادم يرسل 2، العميل يردّ بـ 3)
 
 الاستخدام:
+    # الطريقة 1: JWT مباشر
     python bn__1.py
-  ثم أدخل JWT token (يُستخرج من Local Storage في متصفحك بعد تسجيل الدخول
-  إلى binolla.com). التوكن يُحفظ في credentials.json لإعادة الاستخدام.
+    # ثم اختر "J" للـ JWT والصق التوكن
 
-  أو بصيغة non-interactive:
-    BINOLLA_TOKEN="eyJ0eXA..." python bn__1.py --asset EURUSD_otc --period 1 --days 7
+    # الطريقة 2: تسجيل دخول بالإيميل/كلمة المرور (يفتح متصفح Chromium)
+    python bn__1.py
+    # ثم اختر "E" للإيميل/كلمة المرور
+
+    # أو بصيغة non-interactive:
+    BINOLLA_EMAIL="you@example.com" BINOLLA_PASSWORD="secret" \\
+        python bn__1.py --asset EURUSD_otc --period 1 --days 7 -y
+
+متطلبات Playwright (للطريقة 2 فقط):
+    pip install playwright
+    playwright install chromium
 """
 
 import os
@@ -58,6 +71,13 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import certifi
 import websocket
+
+# Playwright اختياري — يُحمّل فقط عند الحاجة لتسجيل الدخول بالإيميل/كلمة المرور
+try:
+    from playwright.async_api import async_playwright as _async_playwright
+    HAS_PLAYWRIGHT = True
+except Exception:
+    HAS_PLAYWRIGHT = False
 
 try:
     import orjson as _orjson
@@ -1125,7 +1145,7 @@ class Binolla:
         """
         if not self.api:
             return []
-        # Binolla لا يكشف عن endpoint تاريخي صريح مثل history/load في Quotex.
+        # Binolla لا يكشف عن endpoint تاريخي صريح (مثل history/load في المنصات الأخرى).
         # نعتمد على history/last الذي يرجع آخر شموع للأصل الحالي.
         await self.start_candles_stream(asset, timeframe_min)
         await asyncio.sleep(0.5)
@@ -1193,20 +1213,21 @@ class Binolla:
 # SECTION 9: CREDENTIALS MANAGEMENT
 # ==============================================================================
 def load_credentials() -> Optional[Dict[str, str]]:
-    """يقرأ التوكن من credentials.json. يُعيد None إذا لم توجد."""
+    """يقرأ التوكن/الإيميل/كلمة المرور من credentials.json. يُعيد None إذا لم توجد."""
     if not CREDENTIALS_FILE.exists():
         return None
     try:
         data = json.loads(CREDENTIALS_FILE.read_text())
-        if data.get("token"):
+        if data.get("token") or (data.get("email") and data.get("password")):
             return data
         return None
     except Exception:
         return None
 
 
-def save_credentials(token: str, is_demo: bool = True, proxy: str = "") -> bool:
-    """يحفظ التوكن ونوع الحساب والبروكسي في credentials.json."""
+def save_credentials(token: str = "", email: str = "", password: str = "",
+                     is_demo: bool = True, proxy: str = "") -> bool:
+    """يحفظ التوكن والإيميل/كلمة المرور ونوع الحساب في credentials.json."""
     try:
         existing = {}
         if CREDENTIALS_FILE.exists():
@@ -1214,17 +1235,303 @@ def save_credentials(token: str, is_demo: bool = True, proxy: str = "") -> bool:
                 existing = json.loads(CREDENTIALS_FILE.read_text())
             except Exception:
                 pass
-        existing.update({
-            "token": token,
-            "is_demo": is_demo,
-            "proxy": proxy,
-            "saved_at": int(time.time()),
-        })
+        if token:
+            existing["token"] = token
+        if email:
+            existing["email"] = email
+        if password:
+            existing["password"] = password
+        existing["is_demo"] = is_demo
+        if proxy:
+            existing["proxy"] = proxy
+        existing["saved_at"] = int(time.time())
         CREDENTIALS_FILE.write_text(json.dumps(existing, indent=2))
         return True
     except Exception as e:
         logmsg(f"Failed to save credentials: {e}")
         return False
+
+
+def decode_jwt_exp(token: str) -> Optional[int]:
+    """يستخرج حقل `exp` من JWT (دون التحقق من التوقيع). يُعيد timestamp أو None."""
+    if not token or token.count(".") != 2:
+        return None
+    try:
+        import base64
+        payload_b64 = token.split(".")[1]
+        # أضف padding إن لزم
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        decoded = base64.urlsafe_b64decode(payload_b64).decode("utf-8", errors="ignore")
+        data = json.loads(decoded)
+        if isinstance(data, dict) and "exp" in data:
+            return int(data["exp"])
+    except Exception:
+        return None
+    return None
+
+
+def is_token_expired(token: str, leeway_seconds: int = 30) -> bool:
+    """يتحقق إن كان التوكن منتهياً (مع فترة سماح)."""
+    exp = decode_jwt_exp(token)
+    if not exp:
+        return True
+    return time.time() >= (exp - leeway_seconds)
+
+
+# ==============================================================================
+# SECTION 9.5: BROWSER LOGIN VIA PLAYWRIGHT (الإيميل + كلمة المرور)
+# ==============================================================================
+# نموذج تسجيل الدخول في https://binolla.com/login يحتوي على:
+#   - input[name="email"]     (type=text, id ديناميكي مثل :r0:)
+#   - input[name="password"]   (type=password, id ديناميكي مثل :r1:)
+#   - input[name="remember"]   (type=checkbox)
+#   - input[name="cf-turnstile-response"] (مخفي — Cloudflare CAPTCHA)
+#
+# النموذج لا يُرسل عبر HTML form تقليدي، بل عبر JavaScript fetch.
+# لذا نستخدم Playwright (متصفح Chromium حقيقي) لتعبئة الحقول والنقر على زر submit.
+# في حال ظهر Cloudflare Turnstile، نتركه للمستخدم ليحله يدوياً.
+
+# أسماء مفاتيح localStorage المحتملة التي يخزّن فيها Binolla التوكن بعد الدخول
+_JWT_LS_KEYS = (
+    "token", "access_token", "auth_token", "authToken", "accessToken",
+    "jwt", "binolla_token", "bnn_token", "idToken",
+)
+# مفاتيح cookies المحتملة (HTTP-only غالباً، لكن نحاول)
+_JWT_COOKIE_NAMES = (
+    "token", "access_token", "auth_token", "jwt",
+    "bnn_token", "binolla_session",
+)
+
+
+async def login_via_browser(email: str, password: str, remember: bool = True,
+                            headless: bool = False,
+                            timeout: float = 180.0) -> Tuple[bool, str]:
+    """يفتح متصفح Chromium، يعبّئ نموذج Binolla، وينتظر نجاح الدخول.
+
+    يجب تثبيت Playwright أولاً:
+        pip install playwright
+        playwright install chromium
+
+    المعاملات:
+      email    : إيميل المستخدم في Binolla
+      password : كلمة المرور
+      remember : تفعيل "تذكّرني"
+      headless : True للتشغيل بدون واجهة (لا يُنصح به لأن Turnstile قد يتطلب تفاعلاً)
+      timeout  : المهلة القصوى بالثواني
+
+    يُعيد (True, "<JWT>") عند النجاح، أو (False, "<error_msg>") عند الفشل.
+    """
+    if not HAS_PLAYWRIGHT:
+        return (False,
+                "Playwright غير مُثبّت. ثبّته:\n"
+                "  pip install playwright\n"
+                "  playwright install chromium")
+    if not email or not password:
+        return False, "Email or password is empty."
+
+    logmsg(f"{Colors.CYAN}Launching Chromium to log in to binolla.com...{Colors.RESET}")
+    logmsg(f"{Colors.DIM}If Cloudflare Turnstile appears, solve it manually.{Colors.RESET}")
+
+    try:
+        async with _async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=headless,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            ctx = await browser.new_context(
+                user_agent=USER_AGENT,
+                viewport={"width": 1280, "height": 800},
+                locale="en-US",
+            )
+            # إخفاء webdriver flag
+            await ctx.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+            )
+            page = await ctx.new_page()
+
+            # ---- 1) انتقل إلى صفحة الدخول ----
+            logmsg("→ Navigating to https://binolla.com/login ...")
+            try:
+                await page.goto("https://binolla.com/login",
+                               wait_until="domcontentloaded", timeout=45000)
+            except Exception as e:
+                await browser.close()
+                return False, f"Failed to load login page: {e}"
+
+            # ---- 2) انتظر حتى تظهر حقول النموذج (React rendering) ----
+            logmsg("→ Waiting for form fields to render...")
+            try:
+                await page.wait_for_selector('input[name="email"]', timeout=20000)
+                await page.wait_for_selector('input[name="password"]', timeout=20000)
+            except Exception as e:
+                await browser.close()
+                return False, f"Login form fields not found: {e}"
+
+            # ---- 3) عبّئ الحقول باستخدام name= (لا id لأنه ديناميكي) ----
+            logmsg(f"→ Filling email: {email}")
+            await page.fill('input[name="email"]', email)
+            logmsg("→ Filling password: ***")
+            await page.fill('input[name="password"]', password)
+
+            # remember checkbox
+            if remember:
+                try:
+                    cb = await page.query_selector('input[name="remember"]')
+                    if cb is not None:
+                        is_checked = await cb.is_checked()
+                        if not is_checked:
+                            await cb.check()
+                except Exception as e:
+                    logger.debug("Could not tick 'remember': %s", e)
+
+            logmsg(f"{Colors.YELLOW}→ Clicking 'Login' button...{Colors.RESET}")
+            logmsg(f"{Colors.DIM}  If Turnstile CAPTCHA appears, please solve it in the browser window.{Colors.RESET}")
+            logmsg(f"{Colors.DIM}  (The login button may be hidden behind the CAPTCHA widget until solved.){Colors.RESET}")
+
+            # ---- 4) انقر زر submit ----
+            # نحاول النقر العادي أولاً، ثم نعيد المحاولة بـ force=True
+            # لأن Cloudflare Turnstile قد يحجب الزر بصرياً.
+            submit_clicked = False
+            try:
+                # الأفضل: ابحث عن button[type="submit"] داخل النموذج
+                btn = await page.query_selector('form button[type="submit"]')
+                if btn is None:
+                    # احتياطي: أي زر يحتوي على نص "Log In" أو "Sign In"
+                    btn = await page.query_selector(
+                        'button:has-text("Log in"), button:has-text("Sign in"), '
+                        'button:has-text("Login"), button:has-text("Sign In")'
+                    )
+                if btn is not None:
+                    # انتظر 2 ثانية لـ Turnstile ليُحل تلقائياً أحياناً
+                    await asyncio.sleep(2.0)
+                    # محاولة 1: نقر عادي (مع مهلة قصيرة)
+                    try:
+                        await btn.click(timeout=5000)
+                        submit_clicked = True
+                    except Exception as click_err:
+                        logmsg(f"{Colors.DIM}  Normal click blocked (likely by Turnstile): "
+                               f"{str(click_err)[:80]}{Colors.RESET}")
+                        logmsg(f"{Colors.YELLOW}  Retrying with force=True...{Colors.RESET}")
+                        # محاولة 2: نقر مُجبر (يتجاهل حاجب overlay)
+                        try:
+                            await btn.click(force=True, timeout=5000)
+                            submit_clicked = True
+                        except Exception:
+                            # محاولة 3: إرسال Enter على حقل كلمة المرور
+                            logmsg(f"{Colors.DIM}  Force click also failed — pressing Enter on password field.{Colors.RESET}")
+                            await page.press('input[name="password"]', "Enter")
+                            submit_clicked = True
+                else:
+                    # احتياطي أخير: Enter في حقل كلمة المرور
+                    await page.press('input[name="password"]', "Enter")
+                    submit_clicked = True
+            except Exception as e:
+                await browser.close()
+                return False, f"Failed to submit login form: {e}"
+
+            if not submit_clicked:
+                await browser.close()
+                return False, "Could not find login submit button."
+
+            # ---- 5) انتظر إما لـ URL redirect أو لظهور JWT في localStorage ----
+            logmsg(f"→ Waiting up to {int(timeout)}s for login to complete...")
+            start = time.time()
+            token: Optional[str] = None
+            while time.time() - start < timeout:
+                # تحقق من تغيير الـ URL (الخروج من /login)
+                current_url = page.url
+                if "/login" not in current_url:
+                    # انتظر قليلاً ليكتمل تحميل الصفحة الجديدة
+                    await asyncio.sleep(2.0)
+                    logmsg(f"{Colors.GREEN}Redirected to {current_url}{Colors.RESET}")
+                    token = await _extract_jwt_from_browser(ctx, page)
+                    if token:
+                        break
+                # تحقق من localStorage حتى لو لم يتغير URL
+                token = await _extract_jwt_from_browser(ctx, page)
+                if token:
+                    break
+                await asyncio.sleep(1.0)
+
+            if not token:
+                # اعرض رسائل الخطأ إن وُجدت
+                try:
+                    err_el = await page.query_selector(
+                        '[class*="error" i], [class*="alert" i], [role="alert"]')
+                    if err_el is not None:
+                        err_text = (await err_el.text_content() or "").strip()
+                        if err_text:
+                            await browser.close()
+                            return False, f"Login failed: {err_text}"
+                except Exception:
+                    pass
+                await browser.close()
+                return False, "Login timed out — no JWT found."
+
+            logmsg(f"{Colors.GREEN}JWT extracted from browser.{Colors.RESET}")
+            await browser.close()
+            return True, token
+    except Exception as e:
+        log_exception("login_via_browser", e)
+        return False, f"Browser login error: {e}"
+
+
+async def _extract_jwt_from_browser(ctx, page) -> Optional[str]:
+    """يستخرج JWT من localStorage أو cookies في السياق الحالي."""
+    # 1) localStorage
+    try:
+        for key in _JWT_LS_KEYS:
+            val = await page.evaluate(
+                "(k) => localStorage.getItem(k)", key
+            )
+            if val and val.count(".") == 2 and len(val) > 40:
+                # تأكد أنه JWT بصيغة header.payload.signature
+                return val
+    except Exception as e:
+        logger.debug("localStorage read error: %s", e)
+
+    # 1.5) ابحث في كل مفاتيح localStorage عن أي قيمة تبدو JWT
+    try:
+        all_vals = await page.evaluate(
+            """() => {
+                const out = {};
+                for (let i = 0; i < localStorage.length; i++) {
+                    const k = localStorage.key(i);
+                    out[k] = localStorage.getItem(k);
+                }
+                return out;
+            }"""
+        )
+        if isinstance(all_vals, dict):
+            for k, v in all_vals.items():
+                if isinstance(v, str) and v.count(".") == 2 and len(v) > 40:
+                    # تحقق من أن فك base64 للـ payload يعطي JSON
+                    try:
+                        import base64 as _b64
+                        pl = v.split(".")[1]
+                        pl += "=" * (-len(pl) % 4)
+                        decoded = _b64.urlsafe_b64decode(pl).decode("utf-8", errors="ignore")
+                        d = json.loads(decoded)
+                        if isinstance(d, dict) and ("iss" in d or "sub" in d or "aud" in d):
+                            logmsg(f"  {Colors.DIM}Found JWT in localStorage key: '{k}'{Colors.RESET}")
+                            return v
+                    except Exception:
+                        continue
+    except Exception as e:
+        logger.debug("localStorage scan error: %s", e)
+
+    # 2) Cookies (HTTP-only لا تظهر من JS، لكن Playwright يصل إليها)
+    try:
+        cookies = await ctx.cookies()
+        for c in cookies:
+            if c.get("name") in _JWT_COOKIE_NAMES:
+                val = c.get("value", "")
+                if val and val.count(".") == 2 and len(val) > 40:
+                    return val
+    except Exception as e:
+        logger.debug("Cookies read error: %s", e)
+
+    return None
 
 
 # ==============================================================================
@@ -1486,6 +1793,34 @@ async def prompt_account_type() -> bool:
     return True
 
 
+async def prompt_email_password() -> Tuple[Optional[str], Optional[str]]:
+    """يطلب الإيميل وكلمة المرور من المستخدم.
+
+    يُعيد (None, None) إذا اختار المستخدم الخروج.
+    """
+    print(f"{Colors.CYAN}Enter your Binolla account credentials:{Colors.RESET}")
+    print(f"{Colors.DIM}  These will be sent to binolla.com/login via a real browser.{Colors.RESET}")
+    try:
+        email = (await ainput(
+            f"{Colors.YELLOW}Email: {Colors.RESET}"
+        )).strip()
+    except (EOFError, KeyboardInterrupt):
+        return None, None
+    if not email or email.lower() in ('exit', 'quit', 'q'):
+        return None, None
+
+    try:
+        password = (await ainput(
+            f"{Colors.YELLOW}Password: {Colors.RESET}"
+        )).strip()
+    except (EOFError, KeyboardInterrupt):
+        return None, None
+    if not password:
+        return None, None
+
+    return email, password
+
+
 # ==============================================================================
 # SECTION 14: COMMAND-LINE INTERFACE
 # ==============================================================================
@@ -1493,11 +1828,14 @@ def parse_args() -> Dict[str, Any]:
     """معالجة بسيطة لوسائط سطر الأوامر."""
     args = {
         "token": os.environ.get("BINOLLA_TOKEN", ""),
+        "email": os.environ.get("BINOLLA_EMAIL", ""),
+        "password": os.environ.get("BINOLLA_PASSWORD", ""),
         "asset": os.environ.get("BINOLLA_ASSET", "EURUSD_otc"),
         "days": int(os.environ.get("BINOLLA_DAYS", "7")),
         "timeframe": int(os.environ.get("BINOLLA_TIMEFRAME", "1")),
         "is_demo": os.environ.get("BINOLLA_ACCOUNT", "demo").lower() != "real",
         "proxies": os.environ.get("BINOLLA_PROXY", ""),
+        "headless": os.environ.get("BINOLLA_HEADLESS", "0") == "1",
         "non_interactive": False,
     }
     # وسيطات سطر الأوامر البسيطة
@@ -1507,6 +1845,10 @@ def parse_args() -> Dict[str, Any]:
         a = rest[i]
         if a in ("--token",) and i + 1 < len(rest):
             args["token"] = rest[i + 1]; i += 2; continue
+        if a in ("--email",) and i + 1 < len(rest):
+            args["email"] = rest[i + 1]; i += 2; continue
+        if a in ("--password", "--pass") and i + 1 < len(rest):
+            args["password"] = rest[i + 1]; i += 2; continue
         if a in ("--asset",) and i + 1 < len(rest):
             args["asset"] = rest[i + 1]; i += 2; continue
         if a in ("--days",) and i + 1 < len(rest):
@@ -1519,6 +1861,8 @@ def parse_args() -> Dict[str, Any]:
             args["is_demo"] = True; i += 1; continue
         if a in ("--proxy",) and i + 1 < len(rest):
             args["proxies"] = rest[i + 1]; i += 2; continue
+        if a in ("--headless",):
+            args["headless"] = True; i += 1; continue
         if a in ("--non-interactive", "--yes", "-y"):
             args["non_interactive"] = True; i += 1; continue
         if a in ("-h", "--help"):
@@ -1535,44 +1879,131 @@ async def main_async():
     args = parse_args()
     print_banner()
 
-    # ===== قراءة التوكن =====
+    # تحقق من Playwright متاح (للعرض رسالة دائمة واحدة)
+    if not HAS_PLAYWRIGHT:
+        logmsg(f"{Colors.YELLOW}Note: Playwright not installed — email/password login "
+               f"will be unavailable.{Colors.RESET}")
+        logmsg(f"{Colors.DIM}  To enable: pip install playwright && playwright install chromium"
+               f"{Colors.RESET}")
+
+    # ===== 1) حدّد طريقة المصادقة =====
     token = args["token"]
-    if not token:
-        # جرّب credentials.json
+    email = args["email"]
+    password = args["password"]
+
+    # جرّب credentials.json إن لم يُمرّر شيء
+    if not token and not (email and password):
         creds = load_credentials()
         if creds:
-            print(f"{Colors.GREEN}Found saved token (saved at "
-                  f"{datetime.fromtimestamp(creds.get('saved_at', 0)).isoformat()}).{Colors.RESET}")
-            use_saved = (await ainput(
-                f"{Colors.YELLOW}Use saved token? (Y/n): {Colors.RESET}"
+            print(f"{Colors.GREEN}Found saved credentials "
+                  f"(saved at {datetime.fromtimestamp(creds.get('saved_at', 0)).isoformat()}).{Colors.RESET}")
+            if creds.get("token") and not is_token_expired(creds["token"]):
+                print(f"  {Colors.DIM}Saved JWT still valid.{Colors.RESET}")
+            elif creds.get("token"):
+                print(f"  {Colors.YELLOW}Saved JWT expired — will re-login.{Colors.RESET}")
+
+            # اختر الطريقة
+            if creds.get("email") and creds.get("password"):
+                print(f"  Saved email: {creds['email']}")
+            use_choice = (await ainput(
+                f"{Colors.YELLOW}Choose: [J]=use saved JWT, [E]=re-login with email/password, "
+                f"[N]=new JWT paste, (J/e/n): {Colors.RESET}"
+            )).strip().lower() if not args["non_interactive"] else "j"
+
+            if use_choice in ('n', 'N'):
+                token = await prompt_token()
+                if token is None:
+                    return
+            elif use_choice == "e":
+                if not (creds.get("email") and creds.get("password")):
+                    email, password = await prompt_email_password()
+                    if email is None:
+                        return
+                else:
+                    email = creds["email"]
+                    password = creds["password"]
+            else:  # default J
+                if creds.get("token") and not is_token_expired(creds["token"]):
+                    token = creds["token"]
+                    args["is_demo"] = creds.get("is_demo", True)
+                elif creds.get("email") and creds.get("password"):
+                    # الـ JWT منتهٍ لكن لدينا إيميل/كلمة مرور — أعد الدخول
+                    print(f"  {Colors.YELLOW}Saved JWT expired — re-logging in via browser...{Colors.RESET}")
+                    email = creds["email"]
+                    password = creds["password"]
+                else:
+                    # لا JWT ولا إيميل — اطلب JWT
+                    token = await prompt_token()
+                    if token is None:
+                        return
+        else:
+            # لا توجد اعتمادات محفوظة — اسأل المستخدم
+            if args["non_interactive"]:
+                print(f"{Colors.RED}No credentials provided. Set BINOLLA_TOKEN or "
+                      f"BINOLLA_EMAIL+BINOLLA_PASSWORD env vars.{Colors.RESET}")
+                return
+            choice = (await ainput(
+                f"{Colors.YELLOW}Choose authentication: [J]=paste JWT, "
+                f"[E]=email+password via browser, (J/e): {Colors.RESET}"
             )).strip().lower()
-            if use_saved in ('y', '', 'yes'):
-                token = creds["token"]
-                args["is_demo"] = creds.get("is_demo", True)
+            if choice == "e":
+                email, password = await prompt_email_password()
+                if email is None:
+                    return
             else:
                 token = await prompt_token()
                 if token is None:
-                    print(f"\n{Colors.YELLOW}Shutting down...{Colors.RESET}")
                     return
-        else:
-            print(f"{Colors.CYAN}Enter your Binolla JWT token (will be saved automatically).{Colors.RESET}")
-            print(f"{Colors.DIM}  Tip: Open binolla.com in your browser, log in, then open DevTools → "
-                  f"Application → Local Storage → find the 'token' key and copy its value.{Colors.RESET}")
-            token = await prompt_token()
-            if token is None:
-                print(f"\n{Colors.YELLOW}Shutting down...{Colors.RESET}")
-                return
+
+    # إذا قُدّم الإيميل فقط (بدون كلمة مرور) — اطلبها
+    if email and not password and not args["non_interactive"]:
+        password = (await ainput(
+            f"{Colors.YELLOW}Password for {email}: {Colors.RESET}"
+        )).strip()
+        if not password:
+            return
+    if password and not email and not args["non_interactive"]:
+        email = (await ainput(
+            f"{Colors.YELLOW}Email: {Colors.RESET}"
+        )).strip()
+        if not email:
+            return
+
+    # ===== 2) إن وُجد إيميل/كلمة مرور (ولم يُمرّر JWT) — سجّل الدخول عبر المتصفح =====
+    if email and password and not token:
+        logmsg(f"Logging in as {email} via Playwright browser...")
+        ok, jwt_or_err = await login_via_browser(
+            email=email, password=password, remember=True,
+            headless=args["headless"], timeout=180.0,
+        )
+        if not ok:
+            print(f"{Colors.RED}Browser login failed: {jwt_or_err}{Colors.RESET}")
+            return
+        token = jwt_or_err
+        logmsg(f"{Colors.GREEN}Got fresh JWT from Binolla.{Colors.RESET}")
 
     if not token:
-        print(f"{Colors.RED}No token provided.{Colors.RESET}")
+        print(f"{Colors.RED}No token available.{Colors.RESET}")
         return
 
-    # ===== نوع الحساب =====
+    # تحقق من صلاحية التوكن
+    if is_token_expired(token):
+        print(f"{Colors.YELLOW}Warning: JWT appears expired. WebSocket auth may fail.{Colors.RESET}")
+        if email and password:
+            logmsg("Re-logging in via browser...")
+            ok, jwt_or_err = await login_via_browser(
+                email=email, password=password, remember=True,
+                headless=args["headless"], timeout=180.0,
+            )
+            if ok:
+                token = jwt_or_err
+
+    # ===== 3) نوع الحساب =====
     if not args["non_interactive"]:
         is_demo = await prompt_account_type()
         args["is_demo"] = is_demo
 
-    # ===== الاتصال =====
+    # ===== 4) الاتصال =====
     logmsg(f"Connecting to Binolla ({'demo' if args['is_demo'] else 'real'} account)...")
     client = await connect_binolla(token, is_demo=args["is_demo"],
                                    max_attempts=3, proxies=args["proxies"] or None)
@@ -1580,9 +2011,15 @@ async def main_async():
         print(f"\n{Colors.RED}Connection failed after multiple attempts.{Colors.RESET}")
         return
 
-    # حفظ التوكن
-    save_credentials(token, is_demo=args["is_demo"], proxy=args["proxies"])
-    print(f"{Colors.GREEN}Token saved to {CREDENTIALS_FILE.name}{Colors.RESET}\n")
+    # حفظ الاعتمادات (JWT + إيميل/كلمة مرور إن وُجدت)
+    save_credentials(
+        token=token,
+        email=email,
+        password=password,
+        is_demo=args["is_demo"],
+        proxy=args["proxies"],
+    )
+    print(f"{Colors.GREEN}Credentials saved to {CREDENTIALS_FILE.name}{Colors.RESET}\n")
 
     # ابدأ keepalive
     stop_keepalive = asyncio.Event()
