@@ -529,36 +529,37 @@ class BinollaWebsocketClient:
             pass
 
     def _log_incoming(self, msg) -> None:
-        """يسجل رسالة واردة من الخادم."""
+        """يسجل رسالة واردة من الخادم (في ملف السجل + على الـ console)."""
         ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         if isinstance(msg, (bytes, bytearray)):
             data = bytes(msg)
             # جرب JSON decode للـ binary packets
             try:
                 decoded = data.decode("utf-8", errors="ignore")
-                # إن كان JSON واضح، اعرضه كـ JSON
                 if decoded and decoded[0] in '[{':
                     self._ws_log_write(f"← BIN {len(data):6d} {ts} {decoded[:5000]}\n")
+                    # اطبع على الـ console (مقتطع لمنع الفيض)
+                    self._console_msg("←", "BIN", len(data), ts, decoded)
                     return
             except Exception:
                 pass
             # وإلا، اعرض الـ hex أول 200 بايت
             hex_preview = data[:200].hex()
             self._ws_log_write(f"← BIN {len(data):6d} {ts} hex={hex_preview}\n")
-            # اعرض ASCII إن أمكن
             try:
                 ascii_preview = data[:500].decode("utf-8", errors="replace")
                 self._ws_log_write(f"         ascii={ascii_preview}\n")
+                self._console_msg("←", "BIN", len(data), ts, ascii_preview)
             except Exception:
                 pass
         else:
             text = msg.decode("utf-8", errors="ignore") if isinstance(msg, bytes) else str(msg)
-            # اقتطاع الرسائل الطويلة جداً (مع وضع علامة)
             preview = text if len(text) <= 5000 else text[:5000] + f"... [truncated, total={len(text)}]"
             self._ws_log_write(f"← TXT {len(text):6d} {ts} {preview}\n")
+            self._console_msg("←", "TXT", len(text), ts, text)
 
     def _log_outgoing(self, data) -> None:
-        """يسجل رسالة صادرة من العميل."""
+        """يسجل رسالة صادرة من العميل (في ملف السجل + على الـ console)."""
         ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         if isinstance(data, (bytes, bytearray)):
             d = bytes(data)
@@ -566,15 +567,34 @@ class BinollaWebsocketClient:
                 decoded = d.decode("utf-8", errors="ignore")
                 if decoded and decoded[0] in '[{012345"':
                     self._ws_log_write(f"→ BIN {len(d):6d} {ts} {decoded[:5000]}\n")
+                    self._console_msg("→", "BIN", len(d), ts, decoded)
                     return
             except Exception:
                 pass
             hex_preview = d[:200].hex()
             self._ws_log_write(f"→ BIN {len(d):6d} {ts} hex={hex_preview}\n")
+            self._console_msg("→", "BIN", len(d), ts, f"hex={hex_preview[:100]}")
         else:
             text = str(data)
             preview = text if len(text) <= 5000 else text[:5000] + f"... [truncated, total={len(text)}]"
             self._ws_log_write(f"→ TXT {len(text):6d} {ts} {preview}\n")
+            self._console_msg("→", "TXT", len(text), ts, text)
+
+    def _console_msg(self, direction: str, kind: str, length: int,
+                      ts: str, content: str) -> None:
+        """يطبع رسالة WS على الـ console بألوان مميّزة (مقتطعة لـ 250 حرف)."""
+        # اختصر المحتوى المعروض على الـ console لمنع الفيض
+        max_console = 250
+        if len(content) > max_console:
+            display = content[:max_console] + f" ...[+{len(content) - max_console} chars]"
+        else:
+            display = content
+        # لون: أخضر للوارد، أزرق للصادر
+        if direction == "←":
+            color = Colors.GREEN
+        else:
+            color = Colors.BLUE
+        print(f"{color}{direction} {kind} {length:6d} {ts} {display}{Colors.RESET}")
 
     # ---- on_open: يُرسل بعد فتح قناة WebSocket -----
     def on_open(self, wss):
@@ -849,6 +869,39 @@ class BinollaWebsocketClient:
             except Exception:
                 pass
 
+        # جلب الشموع التاريخية عبر history/region
+        # الـ payload الثنائي يجب أن يحتوي على `index` لمطابقة الطلب.
+        if event_name == "s_history/region" and decoded_args:
+            try:
+                payload = decoded_args[0]
+                index = None
+                # ابحث عن `index` في بنى متعددة محتملة:
+                # - dict: {"index":..., "candles":[...]}
+                # - list of dicts: [{"index":..., "candles":[...]}]
+                # - dict تحت "data": {"data":{"index":..., "candles":[...]}}
+                if isinstance(payload, dict):
+                    index = payload.get("index")
+                    if index is None and isinstance(payload.get("data"), dict):
+                        index = payload["data"].get("index")
+                elif isinstance(payload, list) and payload and isinstance(payload[0], dict):
+                    index = payload[0].get("index")
+                # خزّن الـ payload تحت الـ index المُستخرج
+                if index is not None:
+                    self.api.history_regions[index] = payload
+                    # ارفع الـ event المُطابق
+                    loop = self.api._async_loop
+                    if loop and loop.is_running():
+                        asyncio.run_coroutine_threadsafe(
+                            self.api.event_registry.set_event(
+                                f's_history/region_{index}', payload),
+                            loop)
+                    logger.info("s_history/region received (index=%s, payload size=%d bytes)",
+                                index, len(str(payload)[:200]))
+                else:
+                    logger.warning("s_history/region: no index field found in payload")
+            except Exception as e:
+                logger.error("Error handling s_history/region: %s", e)
+
         # الأرصدة
         if event_name == "s_balances/list" and decoded_args:
             try:
@@ -909,10 +962,25 @@ class BinollaWebsocketClient:
 
     # ---- اشتراك ما بعد المصادقة ----
     def _send_post_auth_subscriptions(self) -> None:
-        """يرسل الطلبات الأولية بعد تأكيد المصادقة (يطابق الترتيب المُلتقط)."""
+        """يرسل الطلبات الأولية بعد تأكيد المصادقة (يطابق الترتيب المُلتقط بدقة).
+
+        ملاحظة هامة: بعد `s_authorization`، الخادم يُرسل تلقائياً 3 binary packets:
+          - s_assets/list   (قائمة الأصول)
+          - s_settings/list (الإعدادات)
+          - s_balances/list (الأرصدة)
+        ثم العميل يُرسل فقط الـ 8 طلبات التالية:
+          1) orders/opened/list
+          2) orders/closed/list
+          3) assets/list
+          4) alert/list
+          5) alert/closed/list
+          6) indicator/list
+          7) drawing/load
+          8) asset/list/change  ← هذا الطلب يُفعّل تدفقات s_history/last و s_quotes/list
+        الـ server يستجيب لكل طلب بـ binary packet مطابق (s_<name>).
+        """
         try:
-            # 1) الطلبات النصية (تُرجع data ثنائية عبر s_*)
-            for msg in (
+            subscriptions = [
                 '42["orders/opened/list"]',
                 '42["orders/closed/list"]',
                 '42["assets/list"]',
@@ -920,15 +988,14 @@ class BinollaWebsocketClient:
                 '42["alert/closed/list"]',
                 '42["indicator/list"]',
                 '42["drawing/load"]',
-                '42["balances/list"]',
-                '42["settings/list"]',
-                '42["history/last"]',
-                '42["quotes/list"]',
-            ):
+            ]
+            for msg in subscriptions:
                 self._log_outgoing(msg)
                 self.wss.send(msg)
+                # مهلة صغيرة جداً بين الطلبات (50ms) لتجنّب الـ rate-limiting
+                time.sleep(0.05)
 
-            # 2) تغيير الأصل الافتراضي
+            # 2) تغيير الأصل الافتراضي — يُفعّل s_history/last و s_quotes/list
             asset = self.api.current_asset or "EURUSD_otc"
             period = self.api.current_period or 1
             change_payload = [{"asset": asset, "period": period}]
@@ -1036,6 +1103,7 @@ class BinollaAPI:
         self.opened_orders: Any = None
         self.closed_orders: Any = None
         self.history_last: Any = None
+        self.history_regions: Dict[int, Any] = {}  # {index: payload} — لجلب الشموع المتوازي
         self.realtime_quotes: Any = None
 
         # Event Registry
@@ -1227,6 +1295,38 @@ class BinollaAPI:
     def fetch_history_last(self) -> None:
         self.send_websocket_request('42["history/last"]')
 
+    def fetch_history_region(self, asset: str, time_sec: int, index: Optional[int] = None,
+                              offset: int = 1000, period: int = 1) -> int:
+        """يرسل طلب جلب شموع تاريخية من منطقة زمنية محددة.
+
+        الـ endpoint: `history/region`
+        الـ response: `s_history/region` (binary packet يحتوي على ~offset شمعة JSON)
+
+        المعاملات:
+          asset    : اسم الأصل (مثل 'EURUSD_otc')
+          time_sec : Unix timestamp (seconds) لبداية المنطقة الزمنية
+          index    : مُعرّف فريد للطلب (إن لم يُمرّر، يُولّد تلقائياً)
+          offset   : عدد الشموع لكل batch (افتراضي 1000)
+          period    : الفريم بالدقائق (1 = M1, 5 = M5, 15 = M15, 30 = M30, 60 = H1)
+
+        يُعيد: الـ `index` المُستخدم (لمطابقة الاستجابة عبر event
+        `s_history/region_<index>`).
+        """
+        if index is None:
+            index = next(_request_counter)
+        payload = {
+            "asset": asset,
+            "index": index,
+            "time": int(time_sec),
+            "offset": int(offset),
+            "period": int(period),
+        }
+        data = '42["history/region",' + json.dumps(payload, separators=(",", ":")) + ']'
+        self.send_websocket_request(data)
+        logger.info("history/region sent: asset=%s time=%d offset=%d period=%d index=%d",
+                    asset, time_sec, offset, period, index)
+        return index
+
     def fetch_alerts(self) -> None:
         self.send_websocket_request('42["alert/list"]')
 
@@ -1342,45 +1442,122 @@ class Binolla:
     async def fetch_candles(self, asset: str, days: int, timeframe_min: int,
                             timeout: int = 30, max_workers: int = 5,
                             progress_callback: Optional[Callable] = None) -> List[Dict]:
-        """يجلب الشموع التاريخية من Binolla.
+        """يجلب الشموع التاريخية من Binolla عبر `history/region` بنفس طريقة qx__1.py.
 
-        ملاحظة: Binolla يوفّر `history/last` فقط (آخر N شمعة)، لذا نعتمد على
-        دورة إعادة طلب مع تغيير الـ index للحصول على شموع أبعد.
+        آلية العمل:
+        - عدد الثواني المطلوب = days * 86400
+        - كل batch = `offset` شموع (افتراضي 1000) = offset * period * 60 ثانية
+        - نقسّم النطاق الزمني على max_workers (5 افتراضياً) لجلب متوازٍ
+        - كل worker يُرسل طلبات history/region بالتسلسل مع انتظار s_history/region_<index>
+        - ندمج كل الشموع المستلمة من كل العمال، مع تجنّب التكرار (نفس الـ time)
+        - نُعيد القائمة مرتّبة حسب time
         """
         if not self.api:
             return []
-        # Binolla لا يكشف عن endpoint تاريخي صريح (مثل history/load في المنصات الأخرى).
-        # نعتمد على history/last الذي يرجع آخر شموع للأصل الحالي.
+        # فعّل تدفق البيانات للأصل المطلوب
         await self.start_candles_stream(asset, timeframe_min)
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.3)
 
-        # امسح أي حدث سابق
-        await self.api.event_registry.clear_event("s_history/last")
-        self.api.fetch_history_last()
-        data = await self.api.event_registry.wait_event(
-            "s_history/last", timeout=timeout)
+        period_sec = timeframe_min * 60            # ثانية لكل شمعة
+        chunk_size = FETCH_CHUNK_SIZE              # شمعة لكل batch (200 من qx__1.py)
+        chunk_seconds = chunk_size * period_sec    # ثانية لكل batch
+        amount_of_seconds = days * 86400            # ثانية إجمالية مطلوبة
 
-        if not data:
-            return []
-        # data هو list من args، args[0] هو الـ payload الثنائي
-        try:
-            payload = data[0] if isinstance(data, list) and data else data
-        except Exception:
-            payload = data
+        all_candles: Dict[int, Dict] = {}          # {time: candle} — للدمج دون تكرار
+        current_time = int(time.time())
+        target_start_time = current_time - amount_of_seconds
+        block_size = amount_of_seconds // max_workers
+        semaphore = asyncio.Semaphore(max_workers)
 
-        return self._parse_history(payload)
+        async def worker(start_t: int, end_t: int, worker_id: int) -> List[Dict]:
+            worker_candles: Dict[int, Dict] = {}
+            async with semaphore:
+                oldest_t = start_t
+                consecutive_failures = 0
+                while oldest_t > end_t:
+                    # تحقق من الاتصال قبل كل batch
+                    if not self.api or not getattr(self.api.state, 'check_accepted_connection', False):
+                        break
+                    # ولّد index فريد وأرسل الطلب
+                    index = self.api.fetch_history_region(
+                        asset=asset, time_sec=oldest_t, period=timeframe_min,
+                        offset=chunk_size)
+                    # انتظر الاستجابة (s_history/region_<index> يُطلق من _dispatch_event)
+                    result = await self.api.event_registry.wait_event(
+                        f's_history/region_{index}', timeout=timeout)
+                    if not result:
+                        # لا استجابة — حرّك نافذة الوقت للوراء
+                        oldest_t -= chunk_seconds
+                        consecutive_failures += 1
+                        if consecutive_failures >= 3:
+                            logger.warning("Worker %d: 3 consecutive failures — aborting.",
+                                           worker_id)
+                            break
+                        await asyncio.sleep(FETCH_BATCH_DELAY * 2)
+                        continue
+                    consecutive_failures = 0
+                    # حوّل الـ payload إلى شموع
+                    new_batch = self._parse_history(result)
+                    if not new_batch:
+                        oldest_t -= chunk_seconds
+                        continue
+                    batch_times = []
+                    for c in new_batch:
+                        ts = c.get('time', 0)
+                        if end_t <= ts <= start_t:
+                            worker_candles[ts] = c
+                            batch_times.append(ts)
+                    if not batch_times:
+                        oldest_t -= chunk_seconds
+                        continue
+                    # تحديث أقدم وقت للجلب التالي
+                    new_oldest = min(batch_times)
+                    if progress_callback:
+                        progress_callback(start_t - new_oldest, start_t - end_t,
+                                          len(worker_candles), f"Worker-{worker_id}")
+                    oldest_t = new_oldest if new_oldest < oldest_t else oldest_t - chunk_seconds
+                    await asyncio.sleep(FETCH_BATCH_DELAY)
+            return list(worker_candles.values())
+
+        # شغّل max_workers عمال بالتوازي
+        tasks = []
+        for i in range(max_workers):
+            s = current_time - (i * block_size)
+            e = max(target_start_time, s - block_size)
+            tasks.append(worker(s, e, i))
+        results = await asyncio.gather(*tasks)
+        # ادمج كل النتائج
+        for batch in results:
+            for c in batch:
+                all_candles[c['time']] = c
+        # رتّب حسب time
+        return sorted(all_candles.values(), key=lambda x: x['time'])
 
     def _parse_history(self, payload: Any) -> List[Dict]:
-        """يُحوّل payload الأصلي إلى قائمة شموع بصيغة OHLC."""
+        """يُحوّل payload الـ s_history/region إلى قائمة شموع بصيغة OHLC.
+
+        يدعم عدة بنى محتملة:
+          1) {"index":..., "asset":..., "candles":[[time, OHLC, ...], ...]}
+          2) {"index":..., "candles":[{"time":..., "open":..., ...}, ...]}
+          3) {"data":{"candles":[...]}}
+          4) [[time, open, close, high, low, vol], ...]
+        """
         if not payload:
             return []
-        # Binolla قد يرسل: {"candles": [...]}, أو [...]، أو {"data":[...]}
+        # استخرج candles من payload
+        candles = None
         if isinstance(payload, dict):
             candles = (payload.get("candles") or payload.get("data")
-                       or payload.get("history") or [])
+                       or payload.get("history") or payload.get("list"))
+            # قد تكون candles داخل "data" sub-dict
+            if candles is None and isinstance(payload.get("data"), dict):
+                candles = (payload["data"].get("candles")
+                           or payload["data"].get("data") or [])
         elif isinstance(payload, list):
             candles = payload
         else:
+            return []
+        if not candles:
             return []
 
         parsed = []
@@ -1397,6 +1574,7 @@ class Binolla:
                         parsed.append({"time": t, "open": o, "high": h,
                                        "low": l, "close": cl, "volume": v})
                 elif isinstance(c, list) and len(c) >= 5:
+                    # صيغة Quotex الشائعة: [time, open, close, high, low, volume]
                     parsed.append({
                         "time": int(c[0]), "open": float(c[1]),
                         "high": float(c[3]), "low": float(c[4]),
