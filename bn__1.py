@@ -1001,9 +1001,12 @@ class BinollaAPI:
 
         payload = {
             "suppress_origin": True,
-            "ping_interval": int(self.websocket_client._ping_interval),
-            "ping_timeout": int(self.websocket_client._ping_timeout),
-            "ping_payload": "2",
+            # في EIO=4 لا نُفعّل WS-level ping — الخادم يُرسل Engine.IO PING ("2")
+            # كل 25 ثانية، ونردّ بـ "3" داخل on_message. لو فعّلنا ping_interval هنا،
+            # مكتبة websocket-client ستُرسل WS PING frames (مستوى RFC 6455) وقد
+            # تُربك خادم Socket.IO. نُبقيها معطّلة (0).
+            "ping_interval": 0,
+            "ping_timeout": 0,
             "origin": ORIGIN_URL,
             "host": WS_HOST,
             "sslopt": {
@@ -1781,8 +1784,16 @@ def save_candles_to_json(candles: List[Dict], asset: str,
 # ==============================================================================
 # SECTION 12: KEEPALIVE & CONNECT HELPERS
 # ==============================================================================
-async def keepalive_loop(client: Binolla, stop_event: asyncio.Event) -> None:
-    """يرسل PING كل KEEPALIVE_INTERVAL ثانية للحفاظ على الاتصال حياً."""
+async def keepalive_loop(client: "Binolla", stop_event: asyncio.Event) -> None:
+    """يراقب صحة الاتصال دون إرسال أي رسالة بروتوكولية.
+
+    في EIO=4 (Socket.IO v4)، **الخادم** هو من يُرسل "2" (PING) كل ~25 ثانية،
+    والعميل يردّ بـ "3" (PONG) داخل `BinollaWebsocketClient.on_message`.
+    إرسال "2" من العميل في EIO=4 يُعتبر مخالفة بروتوكول ويُغلق الاتصال فوراً.
+
+    لذا هذه الحلقة لا ترسل شيئاً — فقط تراقب `last_message_at` وتُسلّط ضوءاً
+    إذا بدا الاتصال معلّقاً (أكثر من 60 ثانية دون أي رسالة من الخادم).
+    """
     while not stop_event.is_set():
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=KEEPALIVE_INTERVAL)
@@ -1790,12 +1801,11 @@ async def keepalive_loop(client: Binolla, stop_event: asyncio.Event) -> None:
             pass
         if stop_event.is_set():
             break
-        if client.api and client.api.websocket_client and client.api.websocket_client.wss:
-            try:
-                # في EIO=4 نُرسل "2" (PING) للخادم، يردّ بـ "3"
-                client.api.send_websocket_request("2", no_force_send=True)
-            except Exception as e:
-                logger.debug("Keepalive ping failed: %s", e)
+        # فحص صحي فقط: هل لا تزال الرسائل تأتي؟
+        if client.api:
+            idle = time.time() - client.api.last_message_at
+            if idle > 60.0:
+                logger.warning("No WebSocket messages in %.0fs — connection may be stale.", idle)
 
 
 async def connect_binolla(token: str, is_demo: bool = True,
