@@ -539,7 +539,6 @@ class BinollaWebsocketClient:
                 if decoded and decoded[0] in '[{':
                     self._ws_log_write(f"← BIN {len(data):6d} {ts} {decoded[:5000]}\n")
                     # اطبع على الـ console (مقتطع لمنع الفيض)
-                    self._console_msg("←", "BIN", len(data), ts, decoded)
                     return
             except Exception:
                 pass
@@ -549,14 +548,12 @@ class BinollaWebsocketClient:
             try:
                 ascii_preview = data[:500].decode("utf-8", errors="replace")
                 self._ws_log_write(f"         ascii={ascii_preview}\n")
-                self._console_msg("←", "BIN", len(data), ts, ascii_preview)
             except Exception:
                 pass
         else:
             text = msg.decode("utf-8", errors="ignore") if isinstance(msg, bytes) else str(msg)
             preview = text if len(text) <= 5000 else text[:5000] + f"... [truncated, total={len(text)}]"
             self._ws_log_write(f"← TXT {len(text):6d} {ts} {preview}\n")
-            self._console_msg("←", "TXT", len(text), ts, text)
 
     def _log_outgoing(self, data) -> None:
         """يسجل رسالة صادرة من العميل (في ملف السجل + على الـ console)."""
@@ -567,51 +564,16 @@ class BinollaWebsocketClient:
                 decoded = d.decode("utf-8", errors="ignore")
                 if decoded and decoded[0] in '[{012345"':
                     self._ws_log_write(f"→ BIN {len(d):6d} {ts} {decoded[:5000]}\n")
-                    self._console_msg("→", "BIN", len(d), ts, decoded)
                     return
             except Exception:
                 pass
             hex_preview = d[:200].hex()
             self._ws_log_write(f"→ BIN {len(d):6d} {ts} hex={hex_preview}\n")
-            self._console_msg("→", "BIN", len(d), ts, f"hex={hex_preview[:100]}")
         else:
             text = str(data)
             preview = text if len(text) <= 5000 else text[:5000] + f"... [truncated, total={len(text)}]"
             self._ws_log_write(f"→ TXT {len(text):6d} {ts} {preview}\n")
-            self._console_msg("→", "TXT", len(text), ts, text)
 
-    def _console_msg(self, direction: str, kind: str, length: int,
-                      ts: str, content: str) -> None:
-        """يطبع رسالة WS على الـ console بألوان مميّزة (مقتطعة لـ 250 حرف).
-
-        نرشّح بعض الرسائل المُزعجة (live ticks, periodic re-pushes) لكي
-        لا تُغرق الـ console أثناء انتظار إدخال المستخدم لاسم العملة.
-        """
-        # رشّح الرسائل المُزعجة (تُسجّل في الملف لكن لا تُطبع على الـ console)
-        # 1) s_quotes/list — live ticks كل ~300ms (يُغرق الـ console)
-        # 2) s_assets/list — re-pushed كل ~20s
-        # 3) Engine.IO PING/PONG ("2" / "3")
-        head = content[:120] if content else ""
-        if "s_quotes/list" in head:
-            return
-        if "s_assets/list" in head and direction == "←":
-            # اطبع أول مرة فقط (طويل binary) لكن لا تكرر
-            return
-        if content in ("2", "3"):
-            return  # Engine.IO PING/PONG
-
-        # اختصر المحتوى المعروض على الـ console لمنع الفيض
-        max_console = 250
-        if len(content) > max_console:
-            display = content[:max_console] + f" ...[+{len(content) - max_console} chars]"
-        else:
-            display = content
-        # لون: أخضر للوارد، أزرق للصادر
-        if direction == "←":
-            color = Colors.GREEN
-        else:
-            color = Colors.BLUE
-        print(f"{color}{direction} {kind} {length:6d} {ts} {display}{Colors.RESET}")
 
     # ---- on_open: يُرسل بعد فتح قناة WebSocket -----
     def on_open(self, wss):
