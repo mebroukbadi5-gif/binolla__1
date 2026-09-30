@@ -1444,8 +1444,10 @@ class Binolla:
         await asyncio.sleep(0.3)
 
         period_sec = timeframe_min * 60            # ثانية لكل شمعة
-        chunk_size = FETCH_CHUNK_SIZE              # شمعة لكل batch (200 من qx__1.py)
-        chunk_seconds = chunk_size * period_sec    # ثانية لكل batch
+        # offset = مدة البيانات المطلوبة بالثواني (Binolla يُرجع ~offset ثانية من الـ ticks)
+        # المتصفح يستخدم offset=1000. نستخدم نفس القيمة لتحسين الإنتاجية.
+        offset_sec = 1000
+        chunk_seconds = offset_sec                  # ثانية لكل batch (= 1000 ثانية ≈ 16.7 دقيقة)
         amount_of_seconds = days * 86400            # ثانية إجمالية مطلوبة
 
         all_candles: Dict[int, Dict] = {}          # {time: candle} — للدمج دون تكرار
@@ -1466,7 +1468,7 @@ class Binolla:
                     # ولّد index فريد وأرسل الطلب
                     index = self.api.fetch_history_region(
                         asset=asset, time_sec=oldest_t, period=timeframe_min,
-                        offset=chunk_size)
+                        offset=offset_sec)
                     # انتظر الاستجابة (s_history/region_<index> يُطلق من _dispatch_event)
                     result = await self.api.event_registry.wait_event(
                         f's_history/region_{index}', timeout=timeout)
@@ -1484,6 +1486,7 @@ class Binolla:
                     # حوّل الـ payload إلى شموع
                     new_batch = self._parse_history(result, period_min=timeframe_min)
                     if not new_batch:
+                        logmsg(f"  Worker-{worker_id}: _parse_history returned empty (oldest_t={oldest_t})")
                         oldest_t -= chunk_seconds
                         continue
                     batch_times = []
@@ -1493,15 +1496,20 @@ class Binolla:
                             worker_candles[ts] = c
                             batch_times.append(ts)
                     if not batch_times:
+                        # الـ response خارج نطاق الـ worker — تحرّك للوراء
                         oldest_t -= chunk_seconds
                         continue
                     # تحديث أقدم وقت للجلب التالي
                     new_oldest = min(batch_times)
+                    logmsg(f"  Worker-{worker_id}: batch parsed → {len(new_batch)} candles "
+                           f"(time range {new_oldest}..{max(batch_times)}), "
+                           f"oldest_t {oldest_t} → {new_oldest}")
                     if progress_callback:
                         progress_callback(start_t - new_oldest, start_t - end_t,
                                           len(worker_candles), f"Worker-{worker_id}")
                     oldest_t = new_oldest if new_oldest < oldest_t else oldest_t - chunk_seconds
                     await asyncio.sleep(FETCH_BATCH_DELAY)
+            logmsg(f"  Worker-{worker_id}: done — {len(worker_candles)} candles collected")
             return list(worker_candles.values())
 
         # شغّل max_workers عمال بالتوازي
