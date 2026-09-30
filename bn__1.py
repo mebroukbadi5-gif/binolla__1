@@ -874,14 +874,9 @@ class BinollaWebsocketClient:
                             self.api.event_registry.set_event(
                                 f's_history/region_{index}', payload),
                             loop)
-                    # سجّل تفاصيل الـ payload (الطول الفعلي + أول 500 حرف للهيكلة)
-                    payload_str = str(payload)
-                    payload_len = len(payload_str)
-                    payload_preview = payload_str[:500]
-                    logger.info("s_history/region received (index=%s, payload_size=%d chars)",
-                                index, payload_len)
-                    logmsg(f"{Colors.DIM}s_history/region index={index} size={payload_len} chars "
-                           f"preview: {payload_preview}{Colors.RESET}")
+                    # سكّت الـ logging التفصيلي (نُبقي فقط الرسائل البسيطة مثل qx__1.py)
+                    logger.debug("s_history/region received (index=%s, payload_size=%d chars)",
+                                index, len(str(payload)))
                 else:
                     logger.warning("s_history/region: no index field found in payload")
             except Exception as e:
@@ -1308,7 +1303,7 @@ class BinollaAPI:
         }
         data = '42["history/region",' + json.dumps(payload, separators=(",", ":")) + ']'
         self.send_websocket_request(data)
-        logger.info("history/region sent: asset=%s time=%d offset=%d period=%d index=%d",
+        logger.debug("history/region sent: asset=%s time=%d offset=%d period=%d index=%d",
                     asset, time_sec, offset, period, index)
         return index
 
@@ -1486,7 +1481,6 @@ class Binolla:
                     # حوّل الـ payload إلى شموع
                     new_batch = self._parse_history(result, period_min=timeframe_min)
                     if not new_batch:
-                        logmsg(f"  Worker-{worker_id}: _parse_history returned empty (oldest_t={oldest_t})")
                         oldest_t -= chunk_seconds
                         continue
                     batch_times = []
@@ -1501,15 +1495,11 @@ class Binolla:
                         continue
                     # تحديث أقدم وقت للجلب التالي
                     new_oldest = min(batch_times)
-                    logmsg(f"  Worker-{worker_id}: batch parsed → {len(new_batch)} candles "
-                           f"(time range {new_oldest}..{max(batch_times)}), "
-                           f"oldest_t {oldest_t} → {new_oldest}")
                     if progress_callback:
                         progress_callback(start_t - new_oldest, start_t - end_t,
                                           len(worker_candles), f"Worker-{worker_id}")
                     oldest_t = new_oldest if new_oldest < oldest_t else oldest_t - chunk_seconds
                     await asyncio.sleep(FETCH_BATCH_DELAY)
-            logmsg(f"  Worker-{worker_id}: done — {len(worker_candles)} candles collected")
             return list(worker_candles.values())
 
         # شغّل max_workers عمال بالتوازي
